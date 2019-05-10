@@ -239,7 +239,7 @@ func TestDownloadSchemeManager(t *testing.T) {
 		URL:  "http://localhost:48681/irma_configuration/irma-demo",
 	})
 	require.NoError(t, err)
-	client.NewSession(string(qr), TestHandler{t, c, client, nil})
+	client.NewSession(string(qr), &TestHandler{t: t, c: c, client: client, expectedServerName: nil})
 	if result := <-c; result != nil {
 		require.NoError(t, result.Err)
 	}

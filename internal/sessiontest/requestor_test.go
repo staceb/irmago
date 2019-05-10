@@ -1,7 +1,10 @@
 package sessiontest
 
 import (
+	"bytes"
 	"encoding/json"
+	"io/ioutil"
+	"net/http"
 	"testing"
 
 	"github.com/privacybydesign/irmago"
@@ -10,7 +13,13 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func requestorSessionHelper(t *testing.T, request irma.SessionRequest) *server.SessionResult {
+type testOption int
+
+const (
+	retryPost testOption = 1 << iota
+)
+
+func requestorSessionHelper(t *testing.T, request irma.SessionRequest, options ...testOption) *server.SessionResult {
 	StartIrmaServer(t)
 	defer StopIrmaServer()
 
@@ -25,7 +34,7 @@ func requestorSessionHelper(t *testing.T, request irma.SessionRequest) *server.S
 	})
 	require.NoError(t, err)
 
-	h := TestHandler{t, clientChan, client, nil}
+	h := &TestHandler{t: t, c: clientChan, client: client}
 	j, err := json.Marshal(qr)
 	require.NoError(t, err)
 	client.NewSession(string(j), h)
@@ -35,44 +44,67 @@ func requestorSessionHelper(t *testing.T, request irma.SessionRequest) *server.S
 	}
 
 	serverResult := <-serverChan
-
 	require.Equal(t, token, serverResult.Token)
+
+	opts := 0
+	for _, o := range options {
+		opts |= int(o)
+	}
+	if opts&int(retryPost) > 0 {
+		req, err := http.NewRequest(http.MethodPost,
+			qr.URL+"/proofs",
+			bytes.NewBuffer([]byte(h.result)),
+		)
+		require.NoError(t, err)
+		req.Header.Add("Content-Type", "application/json")
+		res, err := new(http.Client).Do(req)
+		require.NoError(t, err)
+		require.True(t, res.StatusCode < 300)
+		_, err = ioutil.ReadAll(res.Body)
+		require.NoError(t, err)
+	}
+
 	return serverResult
 }
 
 func TestRequestorSignatureSession(t *testing.T) {
 	id := irma.NewAttributeTypeIdentifier("irma-demo.RU.studentCard.studentID")
-	serverResult := requestorSessionHelper(t, &irma.SignatureRequest{
-		Message: "message",
-		DisclosureRequest: irma.DisclosureRequest{
-			BaseRequest: irma.BaseRequest{Type: irma.ActionSigning},
+
+	for _, opt := range []testOption{0, retryPost} {
+		serverResult := requestorSessionHelper(t, &irma.SignatureRequest{
+			Message: "message",
+			DisclosureRequest: irma.DisclosureRequest{
+				BaseRequest: irma.BaseRequest{Type: irma.ActionSigning},
+				Content: irma.AttributeDisjunctionList([]*irma.AttributeDisjunction{{
+					Label:      "foo",
+					Attributes: []irma.AttributeTypeIdentifier{id},
+				}}),
+			},
+		}, opt)
+
+		require.Nil(t, serverResult.Err)
+		require.Equal(t, irma.ProofStatusValid, serverResult.ProofStatus)
+		require.NotEmpty(t, serverResult.Disclosed)
+		require.Equal(t, id, serverResult.Disclosed[0].Identifier)
+		require.Equal(t, "456", serverResult.Disclosed[0].Value["en"])
+	}
+}
+
+func TestRequestorDisclosureSession(t *testing.T) {
+	for _, opt := range []testOption{0, retryPost} {
+		id := irma.NewAttributeTypeIdentifier("irma-demo.RU.studentCard.studentID")
+		request := &irma.DisclosureRequest{
+			BaseRequest: irma.BaseRequest{Type: irma.ActionDisclosing},
 			Content: irma.AttributeDisjunctionList([]*irma.AttributeDisjunction{{
 				Label:      "foo",
 				Attributes: []irma.AttributeTypeIdentifier{id},
 			}}),
-		},
-	})
-
-	require.Nil(t, serverResult.Err)
-	require.Equal(t, irma.ProofStatusValid, serverResult.ProofStatus)
-	require.NotEmpty(t, serverResult.Disclosed)
-	require.Equal(t, id, serverResult.Disclosed[0].Identifier)
-	require.Equal(t, "456", serverResult.Disclosed[0].Value["en"])
-}
-
-func TestRequestorDisclosureSession(t *testing.T) {
-	id := irma.NewAttributeTypeIdentifier("irma-demo.RU.studentCard.studentID")
-	request := &irma.DisclosureRequest{
-		BaseRequest: irma.BaseRequest{Type: irma.ActionDisclosing},
-		Content: irma.AttributeDisjunctionList([]*irma.AttributeDisjunction{{
-			Label:      "foo",
-			Attributes: []irma.AttributeTypeIdentifier{id},
-		}}),
+		}
+		serverResult := testRequestorDisclosure(t, request, opt)
+		require.Len(t, serverResult.Disclosed, 1)
+		require.Equal(t, id, serverResult.Disclosed[0].Identifier)
+		require.Equal(t, "456", serverResult.Disclosed[0].Value["en"])
 	}
-	serverResult := testRequestorDisclosure(t, request)
-	require.Len(t, serverResult.Disclosed, 1)
-	require.Equal(t, id, serverResult.Disclosed[0].Identifier)
-	require.Equal(t, "456", serverResult.Disclosed[0].Value["en"])
 }
 
 func TestRequestorDisclosureMultipleAttrs(t *testing.T) {
@@ -90,8 +122,8 @@ func TestRequestorDisclosureMultipleAttrs(t *testing.T) {
 	require.Len(t, serverResult.Disclosed, 2)
 }
 
-func testRequestorDisclosure(t *testing.T, request *irma.DisclosureRequest) *server.SessionResult {
-	serverResult := requestorSessionHelper(t, request)
+func testRequestorDisclosure(t *testing.T, request *irma.DisclosureRequest, options ...testOption) *server.SessionResult {
+	serverResult := requestorSessionHelper(t, request, options...)
 	require.Nil(t, serverResult.Err)
 	require.Equal(t, irma.ProofStatusValid, serverResult.ProofStatus)
 	return serverResult

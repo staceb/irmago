@@ -65,6 +65,7 @@ type TestHandler struct {
 	c                  chan *SessionResult
 	client             *irmaclient.Client
 	expectedServerName irma.TranslatedString
+	result             string
 }
 
 func (th TestHandler) KeyshareEnrollmentIncomplete(manager irma.SchemeManagerIdentifier) {
@@ -80,7 +81,8 @@ func (th TestHandler) KeyshareEnrollmentDeleted(manager irma.SchemeManagerIdenti
 	th.Failure(&irma.SessionError{Err: errors.Errorf("Keyshare enrollment deleted for %s", manager.String())})
 }
 func (th TestHandler) StatusUpdate(action irma.Action, status irma.Status) {}
-func (th TestHandler) Success(result string) {
+func (th *TestHandler) Success(result string) {
+	th.result = result
 	th.c <- nil
 }
 func (th TestHandler) Cancelled() {

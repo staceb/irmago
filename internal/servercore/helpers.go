@@ -1,6 +1,7 @@
 package servercore
 
 import (
+	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -45,6 +46,32 @@ func (session *session) fail(err server.Error, message string) *irma.RemoteError
 	session.setStatus(server.StatusCancelled)
 	session.result = &server.SessionResult{Err: rerr, Token: session.token, Status: server.StatusCancelled, Type: session.action}
 	return rerr
+}
+
+// unmarshalCache does the following:
+// - if a response has previously been cached in the session object, return the cached response
+//   after some basic sanity checks,
+// - if not, then the message is deserialized into the target using irma.UnmarshalValidate() for
+//   normal further processing. The caller should cache the response in the session object.
+func (session *session) unmarshalCache(message []byte, target interface{}) (int, []byte) {
+	if len(session.responseCache.message) > 0 {
+		// This message has been seen before. We allow replaying the cache of our previous response only if:
+		// - the same was POSTed as last time
+		// - last time was not more than 5 seconds ago (retryablehttp client gives up before this)
+		// - the status is now done (which it should be if this is the second time we receive this message).
+		if sha256.Sum256(session.responseCache.message) != sha256.Sum256(message) ||
+			session.lastActive.Before(time.Now().Add(-5*time.Second)) ||
+			session.status != server.StatusDone {
+			return server.JsonResponse(nil, session.fail(server.ErrorUnexpectedRequest, ""))
+		}
+		return session.responseCache.status, session.responseCache.response
+	}
+
+	session.responseCache.message = message
+	if err := irma.UnmarshalValidate(message, target); err != nil {
+		return server.JsonResponse(nil, session.fail(server.ErrorMalformedInput, err.Error()))
+	}
+	return 0, nil
 }
 
 // Issuance helpers

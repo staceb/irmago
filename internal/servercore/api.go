@@ -341,6 +341,7 @@ func (s *Server) HandleProtocolMessage(
 		}
 		status, output = server.JsonResponse(nil, session.fail(server.ErrorInvalidRequest, ""))
 		return
+
 	default:
 		if noun == "statusevents" {
 			err := server.RemoteError(server.ErrorInvalidRequest, "server sent events not supported by this server")
@@ -361,29 +362,34 @@ func (s *Server) HandleProtocolMessage(
 
 		if noun == "commitments" && session.action == irma.ActionIssuing {
 			commitments := &irma.IssueCommitmentMessage{}
-			if err := irma.UnmarshalValidate(message, commitments); err != nil {
-				status, output = server.JsonResponse(nil, session.fail(server.ErrorMalformedInput, ""))
+			status, output = session.unmarshalCache(message, commitments)
+			if len(output) != 0 {
 				return
 			}
 			status, output = server.JsonResponse(session.handlePostCommitments(commitments))
+			session.responseCache.status, session.responseCache.response = status, output
 			return
 		}
+
 		if noun == "proofs" && session.action == irma.ActionDisclosing {
-			disclosure := irma.Disclosure{}
-			if err := irma.UnmarshalValidate(message, &disclosure); err != nil {
-				status, output = server.JsonResponse(nil, session.fail(server.ErrorMalformedInput, ""))
+			disclosure := &irma.Disclosure{}
+			status, output = session.unmarshalCache(message, disclosure)
+			if len(output) != 0 {
 				return
 			}
 			status, output = server.JsonResponse(session.handlePostDisclosure(disclosure))
+			session.responseCache.status, session.responseCache.response = status, output
 			return
 		}
+
 		if noun == "proofs" && session.action == irma.ActionSigning {
 			signature := &irma.SignedMessage{}
-			if err := irma.UnmarshalValidate(message, signature); err != nil {
-				status, output = server.JsonResponse(nil, session.fail(server.ErrorMalformedInput, ""))
+			status, output = session.unmarshalCache(message, signature)
+			if len(output) != 0 {
 				return
 			}
 			status, output = server.JsonResponse(session.handlePostSignature(signature))
+			session.responseCache.status, session.responseCache.response = status, output
 			return
 		}
 

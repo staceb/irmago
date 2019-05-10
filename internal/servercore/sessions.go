@@ -23,9 +23,10 @@ type session struct {
 	rrequest    irma.RequestorRequest
 	request     irma.SessionRequest
 
-	status     server.Status
-	prevStatus server.Status
-	evtSource  eventsource.EventSource
+	status        server.Status
+	prevStatus    server.Status
+	evtSource     eventsource.EventSource
+	responseCache responseCache
 
 	lastActive time.Time
 	result     *server.SessionResult
@@ -34,6 +35,12 @@ type session struct {
 
 	conf     *server.Configuration
 	sessions sessionStore
+}
+
+type responseCache struct {
+	message  []byte
+	response []byte
+	status   int
 }
 
 type sessionStore interface {

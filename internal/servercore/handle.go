@@ -23,20 +23,28 @@ func (session *session) handleDelete() {
 }
 
 func (session *session) handleGetRequest(min, max *irma.ProtocolVersion) (irma.SessionRequest, *irma.RemoteError) {
-	if session.status != server.StatusInitialized {
+	switch session.status {
+	case server.StatusInitialized:
+		session.markAlive()
+
+		var err error
+		if session.version, err = chooseProtocolVersion(min, max); err != nil {
+			return nil, session.fail(server.ErrorProtocolVersion, "")
+		}
+		session.conf.Logger.WithFields(logrus.Fields{"session": session.token, "version": session.version.String()}).Debugf("Protocol version negotiated")
+		session.request.SetVersion(session.version)
+
+		session.setStatus(server.StatusConnected)
+		return session.request, nil
+
+	// irmago's retryablehttp can cause multiple requests to be sent, so don't reject GETs if the
+	// session status has already progressed to StatusConnected
+	case server.StatusConnected:
+		return session.request, nil
+
+	default:
 		return nil, server.RemoteError(server.ErrorUnexpectedRequest, "Session already started")
 	}
-	session.markAlive()
-
-	var err error
-	if session.version, err = chooseProtocolVersion(min, max); err != nil {
-		return nil, session.fail(server.ErrorProtocolVersion, "")
-	}
-	session.conf.Logger.WithFields(logrus.Fields{"session": session.token, "version": session.version.String()}).Debugf("Protocol version negotiated")
-	session.request.SetVersion(session.version)
-
-	session.setStatus(server.StatusConnected)
-	return session.request, nil
 }
 
 func (session *session) handleGetStatus() (server.Status, *irma.RemoteError) {
@@ -66,7 +74,7 @@ func (session *session) handlePostSignature(signature *irma.SignedMessage) (*irm
 	return &session.result.ProofStatus, rerr
 }
 
-func (session *session) handlePostDisclosure(disclosure irma.Disclosure) (*irma.ProofStatus, *irma.RemoteError) {
+func (session *session) handlePostDisclosure(disclosure *irma.Disclosure) (*irma.ProofStatus, *irma.RemoteError) {
 	if session.status != server.StatusConnected {
 		return nil, server.RemoteError(server.ErrorUnexpectedRequest, "Session not yet started or already finished")
 	}
