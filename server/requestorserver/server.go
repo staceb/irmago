@@ -379,10 +379,8 @@ func (s *Server) handleJwtProofs(w http.ResponseWriter, r *http.Request) {
 	case irma.ActionSigning:
 		claims["sub"] = "abs_result"
 	default:
-		if res == nil {
-			server.WriteError(w, server.ErrorInvalidRequest, "")
-			return
-		}
+		server.WriteError(w, server.ErrorInvalidRequest, "")
+		return
 	}
 	claims["iat"] = time.Now().Unix()
 	if s.conf.JwtIssuer != "" {
