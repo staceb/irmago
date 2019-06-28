@@ -271,7 +271,7 @@ func (conf *Configuration) ParseSchemeManagerFolder(dir string, manager *SchemeM
 		manager.Status = SchemeManagerStatusInvalidIndex
 		return
 	}
-	exists, err := conf.pathToDescription(manager, dir+"/description.xml", manager)
+	exists, err := conf.pathToDescription(manager, filepath.Join(dir, "/description.xml"), manager)
 	if err != nil {
 		manager.Status = SchemeManagerStatusParsingError
 		return
@@ -460,7 +460,7 @@ func (conf *Configuration) Prune() {
 func (conf *Configuration) parseIssuerFolders(manager *SchemeManager, path string) error {
 	return iterateSubfolders(path, func(dir string) error {
 		issuer := &Issuer{}
-		exists, err := conf.pathToDescription(manager, dir+"/description.xml", issuer)
+		exists, err := conf.pathToDescription(manager, filepath.Join(dir, "/description.xml"), issuer)
 		if err != nil {
 			return err
 		}
@@ -477,7 +477,7 @@ func (conf *Configuration) parseIssuerFolders(manager *SchemeManager, path strin
 
 		conf.Issuers[issuer.Identifier()] = issuer
 		issuer.Valid = conf.SchemeManagers[issuer.SchemeManagerIdentifier()].Valid
-		return conf.parseCredentialsFolder(manager, issuer, dir+"/Issues/")
+		return conf.parseCredentialsFolder(manager, issuer, filepath.Join(dir, "/Issues/"))
 	})
 }
 
@@ -572,7 +572,7 @@ func (conf *Configuration) parseCredentialsFolder(manager *SchemeManager, issuer
 	var foundcred bool
 	err := iterateSubfolders(path, func(dir string) error {
 		cred := &CredentialType{}
-		exists, err := conf.pathToDescription(manager, dir+"/description.xml", cred)
+		exists, err := conf.pathToDescription(manager, filepath.Join(dir, "/description.xml"), cred)
 		if err != nil {
 			return err
 		}
@@ -789,15 +789,15 @@ func (conf *Configuration) InstallSchemeManager(manager *SchemeManager, publicke
 
 	t := NewHTTPTransport(manager.URL)
 	path := fmt.Sprintf("%s/%s", conf.Path, name)
-	if err := t.GetFile("description.xml", path+"/description.xml"); err != nil {
+	if err := t.GetFile("description.xml", filepath.Join(path, "/description.xml")); err != nil {
 		return err
 	}
 	if publickey != nil {
-		if err := fs.SaveFile(path+"/pk.pem", publickey); err != nil {
+		if err := fs.SaveFile(filepath.Join(path, "/pk.pem"), publickey); err != nil {
 			return err
 		}
 	} else {
-		if err := t.GetFile("pk.pem", path+"/pk.pem"); err != nil {
+		if err := t.GetFile("pk.pem", filepath.Join(path, "/pk.pem")); err != nil {
 			return err
 		}
 	}
@@ -1136,7 +1136,8 @@ func (conf *Configuration) VerifySignature(id SchemeManagerIdentifier) (err erro
 	}()
 
 	dir := filepath.Join(conf.Path, id.String())
-	if err := fs.AssertPathExists(dir+"/index", dir+"/index.sig", dir+"/pk.pem"); err != nil {
+	if err := fs.AssertPathExists(filepath.Join(dir,"/index"),
+		filepath.Join(dir, "/index.sig"), filepath.Join(dir,"/pk.pem")); err != nil {
 		return errors.New("Missing scheme manager index file, signature, or public key")
 	}
 
