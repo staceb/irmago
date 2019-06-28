@@ -1027,8 +1027,21 @@ func (conf *Configuration) parseIndex(name string, manager *SchemeManager) (Sche
 }
 
 func (conf *Configuration) checkUnsignedFiles(name string, index SchemeManagerIndex) error {
-	return filepath.Walk(filepath.Join(conf.Path, name), func(path string, info os.FileInfo, err error) error {
-		relpath, err := relativePath(conf.Path, path)
+	confPath := conf.Path
+	path := filepath.Join(confPath, name)
+	info, err := os.Lstat(path)
+	if err != nil {
+		return err
+	}
+	// When a symbolic link is found, the scheme should be validated in the original irma_configuration directory
+	if info.Mode()&os.ModeSymlink != 0 {
+		if path, err = os.Readlink(path); err != nil {
+			return err
+		}
+		confPath = filepath.Join(path, "..")
+	}
+	return filepath.Walk(path, func(path string, info os.FileInfo, err error) error {
+		relpath, err := relativePath(confPath, path)
 		if err != nil {
 			return err
 		}
@@ -1136,8 +1149,8 @@ func (conf *Configuration) VerifySignature(id SchemeManagerIdentifier) (err erro
 	}()
 
 	dir := filepath.Join(conf.Path, id.String())
-	if err := fs.AssertPathExists(filepath.Join(dir,"/index"),
-		filepath.Join(dir, "/index.sig"), filepath.Join(dir,"/pk.pem")); err != nil {
+	if err := fs.AssertPathExists(filepath.Join(dir, "/index"),
+		filepath.Join(dir, "/index.sig"), filepath.Join(dir, "/pk.pem")); err != nil {
 		return errors.New("Missing scheme manager index file, signature, or public key")
 	}
 
