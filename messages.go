@@ -1,12 +1,11 @@
 package irma
 
 import (
+	"bytes"
 	"encoding/json"
 	"net/url"
 	"strconv"
 	"strings"
-
-	"bytes"
 
 	"fmt"
 
@@ -190,16 +189,44 @@ const (
 	// Server returned unexpected or malformed response
 	ErrorServerResponse = ErrorType("serverResponse")
 	// Credential type not present in our Configuration
-	ErrorUnknownCredentialType = ErrorType("unknownCredentialType")
+	ErrorUnknownIdentifier = ErrorType("unknownIdentifier")
 	// Error during downloading of credential type, issuer, or public keys
 	ErrorConfigurationDownload = ErrorType("configurationDownload")
 	// IRMA requests refers to unknown scheme manager
 	ErrorUnknownSchemeManager = ErrorType("unknownSchemeManager")
 	// A session is requested involving a scheme manager that has some problem
 	ErrorInvalidSchemeManager = ErrorType("invalidSchemeManager")
+	// Invalid session request
+	ErrorInvalidRequest = ErrorType("invalidRequest")
 	// Recovered panic
 	ErrorPanic = ErrorType("panic")
 )
+
+type Disclosure struct {
+	Proofs  gabi.ProofList            `json:"proofs"`
+	Indices DisclosedAttributeIndices `json:"indices"`
+}
+
+// DisclosedAttributeIndices contains, for each conjunction of an attribute disclosure request,
+// a list of attribute indices, pointing to where the disclosed attributes for that conjunction
+// can be found within a gabi.ProofList.
+type DisclosedAttributeIndices [][]*DisclosedAttributeIndex
+
+// DisclosedAttributeIndex points to a specific attribute in a gabi.ProofList.
+type DisclosedAttributeIndex struct {
+	CredentialIndex int                  `json:"cred"`
+	AttributeIndex  int                  `json:"attr"`
+	Identifier      CredentialIdentifier `json:"-"` // credential from which this attribute was disclosed
+}
+
+type IssueCommitmentMessage struct {
+	*gabi.IssueCommitmentMessage
+	Indices DisclosedAttributeIndices `json:"indices"`
+}
+
+func (err ErrorType) Error() string {
+	return string(err)
+}
 
 func (e *SessionError) Error() string {
 	var buffer bytes.Buffer
@@ -240,28 +267,6 @@ func (e *SessionError) Stack() string {
 	}
 
 	return ""
-}
-
-type Disclosure struct {
-	Proofs  gabi.ProofList            `json:"proofs"`
-	Indices DisclosedAttributeIndices `json:"indices"`
-}
-
-// DisclosedAttributeIndices contains, for each conjunction of an attribute disclosure request,
-// a list of attribute indices, pointing to where the disclosed attributes for that conjunction
-// can be found within a gabi.ProofList.
-type DisclosedAttributeIndices [][]*DisclosedAttributeIndex
-
-// DisclosedAttributeIndex points to a specific attribute in a gabi.ProofList.
-type DisclosedAttributeIndex struct {
-	CredentialIndex int                  `json:"cred"`
-	AttributeIndex  int                  `json:"attr"`
-	Identifier      CredentialIdentifier `json:"-"` // credential from which this attribute was disclosed
-}
-
-type IssueCommitmentMessage struct {
-	*gabi.IssueCommitmentMessage
-	Indices DisclosedAttributeIndices `json:"indices"`
 }
 
 func (i *IssueCommitmentMessage) Disclosure() *Disclosure {

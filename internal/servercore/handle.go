@@ -28,14 +28,30 @@ func (session *session) handleGetRequest(min, max *irma.ProtocolVersion) (irma.S
 	}
 	session.markAlive()
 
+	logger := session.conf.Logger.WithFields(logrus.Fields{"session": session.token})
+
+	// Handle legacy clients that do not support condiscon, by attempting to convert the condiscon
+	// session request to the legacy session request format
+	legacy, legacyErr := session.request.Legacy()
+	session.legacyCompatible = legacyErr == nil
+	if legacyErr != nil {
+		logger.Info("Using condiscon: backwards compatibility with legacy IRMA apps is disabled")
+	}
+
 	var err error
-	if session.version, err = chooseProtocolVersion(min, max); err != nil {
+	if session.version, err = session.chooseProtocolVersion(min, max); err != nil {
 		return nil, session.fail(server.ErrorProtocolVersion, "")
 	}
-	session.conf.Logger.WithFields(logrus.Fields{"session": session.token, "version": session.version.String()}).Debugf("Protocol version negotiated")
-	session.request.SetVersion(session.version)
+	logger.WithFields(logrus.Fields{"version": session.version.String()}).Debugf("Protocol version negotiated")
+	session.request.Base().ProtocolVersion = session.version
 
 	session.setStatus(server.StatusConnected)
+
+	if session.version.Below(2, 5) {
+		logger.Info("Returning legacy session format")
+		legacy.Base().ProtocolVersion = session.version
+		return legacy, nil
+	}
 	return session.request, nil
 }
 
@@ -105,7 +121,7 @@ func (session *session) handlePostCommitments(commitments *irma.IssueCommitmentM
 	disclosureproofs := irma.ProofList(commitments.Proofs[:discloseCount])
 	pubkeys, err := disclosureproofs.ExtractPublicKeys(session.conf.IrmaConfiguration)
 	if err != nil {
-		return nil, session.fail(server.ErrorInvalidProofs, err.Error())
+		return nil, session.fail(server.ErrorMalformedInput, err.Error())
 	}
 	for _, cred := range request.Credentials {
 		iss := cred.CredentialTypeID.IssuerIdentifier()
@@ -128,7 +144,7 @@ func (session *session) handlePostCommitments(commitments *irma.IssueCommitmentM
 
 	// Verify all proofs and check disclosed attributes, if any, against request
 	session.result.Disclosed, session.result.ProofStatus, err = commitments.Disclosure().VerifyAgainstDisjunctions(
-		session.conf.IrmaConfiguration, request.Disclose, request.Context, request.Nonce, pubkeys, false)
+		session.conf.IrmaConfiguration, request.Disclose, request.GetContext(), request.GetNonce(nil), pubkeys, false)
 	if err != nil {
 		if err == irma.ErrorMissingPublicKey {
 			return nil, session.fail(server.ErrorUnknownPublicKey, "")
@@ -150,7 +166,10 @@ func (session *session) handlePostCommitments(commitments *irma.IssueCommitmentM
 		pk, _ := session.conf.IrmaConfiguration.PublicKey(id, cred.KeyCounter)
 		sk, _ := session.conf.PrivateKey(id)
 		issuer := gabi.NewIssuer(sk, pk, one)
-		proof := commitments.Proofs[i+discloseCount].(*gabi.ProofU)
+		proof, ok := commitments.Proofs[i+discloseCount].(*gabi.ProofU)
+		if !ok {
+			return nil, session.fail(server.ErrorMalformedInput, "Received invalid issuance commitment")
+		}
 		attributes, err := cred.AttributeList(session.conf.IrmaConfiguration, 0x03)
 		if err != nil {
 			return nil, session.fail(server.ErrorIssuanceFailed, err.Error())

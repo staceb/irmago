@@ -2,11 +2,13 @@ package sessiontest
 
 import (
 	"encoding/json"
+	"reflect"
 	"testing"
 
 	"github.com/privacybydesign/irmago"
 	"github.com/privacybydesign/irmago/internal/fs"
 	"github.com/privacybydesign/irmago/internal/test"
+	"github.com/privacybydesign/irmago/irmaclient"
 	"github.com/stretchr/testify/require"
 )
 
@@ -45,9 +47,18 @@ func TestDefaultCredentialValidity(t *testing.T) {
 	sessionHelper(t, request, "issue", client)
 }
 
-func TestIssuanceOptionalEmptyAttributes(t *testing.T) {
+func TestIssuanceDisclosureEmptyAttributes(t *testing.T) {
+	client, _ := parseStorage(t)
+	defer test.ClearTestStorage(t)
+
 	req := getNameIssuanceRequest()
-	sessionHelper(t, req, "issue", nil)
+	sessionHelper(t, req, "issue", client)
+
+	// Test disclosing our null attribute
+	req2 := getDisclosureRequest(irma.NewAttributeTypeIdentifier("irma-demo.MijnOverheid.fullName.prefix"))
+	res := requestorSessionHelper(t, req2, client)
+	require.Nil(t, res.Err)
+	require.Nil(t, res.Disclosed[0][0].RawValue)
 }
 
 func TestIssuanceOptionalZeroLengthAttributes(t *testing.T) {
@@ -93,6 +104,48 @@ func TestIssuanceSingletonCredential(t *testing.T) {
 	require.Nil(t, client.Attributes(credid, 1))
 }
 
+func TestUnsatisfiableDisclosureSession(t *testing.T) {
+	client, _ := parseStorage(t)
+	defer test.ClearTestStorage(t)
+
+	request := irma.NewDisclosureRequest()
+	request.Disclose = irma.AttributeConDisCon{
+		irma.AttributeDisCon{
+			irma.AttributeCon{
+				irma.NewAttributeRequest("irma-demo.MijnOverheid.root.BSN"),
+				irma.NewAttributeRequest("irma-demo.RU.studentCard.level"),
+			},
+			irma.AttributeCon{
+				irma.NewAttributeRequest("test.test.mijnirma.email"),
+				irma.NewAttributeRequest("irma-demo.MijnOverheid.fullName.firstname"),
+				irma.NewAttributeRequest("irma-demo.MijnOverheid.fullName.familyname"),
+			},
+		},
+		irma.AttributeDisCon{
+			irma.AttributeCon{
+				irma.NewAttributeRequest("irma-demo.RU.studentCard.level"),
+			},
+		},
+	}
+
+	missing := irmaclient.MissingAttributes{}
+	require.NoError(t, json.Unmarshal([]byte(`{
+		"0": {
+			"0": {
+				"0": {"type": "irma-demo.MijnOverheid.root.BSN"}
+			},
+			"1": {
+				"1": {"type": "irma-demo.MijnOverheid.fullName.firstname"},
+				"2": {"type": "irma-demo.MijnOverheid.fullName.familyname"}
+			}
+		}
+	}`), &missing))
+	require.True(t, reflect.DeepEqual(
+		missing,
+		requestorSessionHelper(t, request, client, sessionOptionUnsatisfiableRequest).Missing),
+	)
+}
+
 /* There is an annoying difference between how Java and Go convert big integers to and from
 byte arrays: in Java the sign of the integer is taken into account, but not in Go. This means
 that in Java, when converting a bigint to or from a byte array, the most significant bit
@@ -122,6 +175,21 @@ func TestAttributeByteEncoding(t *testing.T) {
 	sessionHelper(t, request, "issue", client)
 }
 
+func TestOutdatedClientIrmaConfiguration(t *testing.T) {
+	client, _ := parseStorage(t)
+	defer test.ClearTestStorage(t)
+
+	// Remove old studentCard credential from before support for optional attributes, and issue a new one
+	require.NoError(t, client.RemoveAllCredentials())
+	require.Nil(t, requestorSessionHelper(t, getIssuanceRequest(true), client).Err)
+
+	// client does not have updated irma_configuration with new attribute irma-demo.RU.studentCard.newAttribute,
+	// and the server does. Disclose an attribute from this credential. The client implicitly discloses value 0
+	// for the new attribute, and the server accepts.
+	req := getDisclosureRequest(irma.NewAttributeTypeIdentifier("irma-demo.RU.studentCard.level"))
+	require.Nil(t, requestorSessionHelper(t, req, client, sessionOptionUpdatedIrmaConfiguration).Err)
+}
+
 func TestDisclosureNewAttributeUpdateSchemeManager(t *testing.T) {
 	client, _ := parseStorage(t)
 	defer test.ClearTestStorage(t)
@@ -131,20 +199,32 @@ func TestDisclosureNewAttributeUpdateSchemeManager(t *testing.T) {
 	attrid := irma.NewAttributeTypeIdentifier("irma-demo.RU.studentCard.newAttribute")
 	require.False(t, client.Configuration.CredentialTypes[credid].ContainsAttribute(attrid))
 
-	client.Configuration.SchemeManagers[schemeid].URL = "http://localhost:48681/irma_configuration_updated/irma-demo"
-	disclosureRequest := irma.DisclosureRequest{
-		Content: irma.AttributeDisjunctionList{
-			&irma.AttributeDisjunction{
-				Label: "foo",
-				Attributes: []irma.AttributeTypeIdentifier{
-					attrid,
-				},
-			},
-		},
-	}
+	// Remove old studentCard credential from before support for optional attributes, and issue a new one
+	require.NoError(t, client.RemoveAllCredentials())
+	require.Nil(t, requestorSessionHelper(t, getIssuanceRequest(true), client).Err)
 
-	client.Configuration.Download(&disclosureRequest)
+	// Trigger downloading the updated irma_configuration using a disclosure request containing the
+	// new attribute, and inform the client
+	client.Configuration.SchemeManagers[schemeid].URL = "http://localhost:48681/irma_configuration_updated/irma-demo"
+	newAttrRequest := irma.NewDisclosureRequest(attrid)
+	downloaded, err := client.Configuration.Download(newAttrRequest)
+	require.NoError(t, err)
+	require.NoError(t, client.ConfigurationUpdated(downloaded))
+
+	// Our new attribute now exists in the configuration
 	require.True(t, client.Configuration.CredentialTypes[credid].ContainsAttribute(attrid))
+
+	// Disclose an old attribute (i.e. not newAttribute) to a server with an old configuration
+	// Since our client has a new configuration it hides the new attribute that is not yet in the
+	// server's configuration. All proofs are however valid as they should be and the server accepts.
+	levelRequest := getDisclosureRequest(irma.NewAttributeTypeIdentifier("irma-demo.RU.studentCard.level"))
+	require.Nil(t, requestorSessionHelper(t, levelRequest, client).Err)
+
+	// Disclose newAttribute to a server with a new configuration. This attribute was added
+	// after we received a credential without it, so its value in this credential is 0.
+	res := requestorSessionHelper(t, newAttrRequest, client, sessionOptionUpdatedIrmaConfiguration)
+	require.Nil(t, res.Err)
+	require.Nil(t, res.Disclosed[0][0].RawValue)
 }
 
 func TestIssueNewAttributeUpdateSchemeManager(t *testing.T) {
@@ -159,7 +239,8 @@ func TestIssueNewAttributeUpdateSchemeManager(t *testing.T) {
 	client.Configuration.SchemeManagers[schemeid].URL = "http://localhost:48681/irma_configuration_updated/irma-demo"
 	issuanceRequest := getIssuanceRequest(true)
 	issuanceRequest.Credentials[0].Attributes["newAttribute"] = "foobar"
-	client.Configuration.Download(issuanceRequest)
+	_, err := client.Configuration.Download(issuanceRequest)
+	require.NoError(t, err)
 	require.True(t, client.Configuration.CredentialTypes[credid].ContainsAttribute(attrid))
 }
 
@@ -175,7 +256,8 @@ func TestIssueOptionalAttributeUpdateSchemeManager(t *testing.T) {
 	client.Configuration.SchemeManagers[schemeid].URL = "http://localhost:48681/irma_configuration_updated/irma-demo"
 	issuanceRequest := getIssuanceRequest(true)
 	delete(issuanceRequest.Credentials[0].Attributes, "level")
-	client.Configuration.Download(issuanceRequest)
+	_, err := client.Configuration.Download(issuanceRequest)
+	require.NoError(t, err)
 	require.True(t, client.Configuration.CredentialTypes[credid].AttributeType(attrid).IsOptional())
 }
 
@@ -189,7 +271,8 @@ func TestIssueNewCredTypeUpdateSchemeManager(t *testing.T) {
 
 	client.Configuration.SchemeManagers[schemeid].URL = "http://localhost:48681/irma_configuration_updated/irma-demo"
 	request := getIssuanceRequest(true)
-	client.Configuration.Download(request)
+	_, err := client.Configuration.Download(request)
+	require.NoError(t, err)
 
 	require.Contains(t, client.Configuration.CredentialTypes, credid)
 
@@ -206,17 +289,38 @@ func TestDisclosureNewCredTypeUpdateSchemeManager(t *testing.T) {
 	require.NotContains(t, client.Configuration.CredentialTypes, credid)
 
 	client.Configuration.SchemeManagers[schemeid].URL = "http://localhost:48681/irma_configuration_updated/irma-demo"
-	request := &irma.DisclosureRequest{
-		Content: irma.AttributeDisjunctionList([]*irma.AttributeDisjunction{{
-			Label:      "foo",
-			Attributes: []irma.AttributeTypeIdentifier{attrid},
-		}}),
-	}
-	client.Configuration.Download(request)
-
+	request := irma.NewDisclosureRequest(attrid)
+	_, err := client.Configuration.Download(request)
+	require.NoError(t, err)
 	require.Contains(t, client.Configuration.CredentialTypes, credid)
 
 	test.ClearTestStorage(t)
+}
+
+func TestDisclosureNonexistingCredTypeUpdateSchemeManager(t *testing.T) {
+	client, _ := parseStorage(t)
+	request := irma.NewDisclosureRequest(
+		irma.NewAttributeTypeIdentifier("irma-demo.RU.foo.bar"),
+		irma.NewAttributeTypeIdentifier("irma-demo.baz.qux.abc"),
+	)
+	_, err := client.Configuration.Download(request)
+	require.Error(t, err)
+
+	expectedErr := &irma.UnknownIdentifierError{
+		ErrorType: irma.ErrorUnknownIdentifier,
+		Missing: &irma.IrmaIdentifierSet{
+			SchemeManagers: map[irma.SchemeManagerIdentifier]struct{}{},
+			PublicKeys:     map[irma.IssuerIdentifier][]int{},
+			Issuers: map[irma.IssuerIdentifier]struct{}{
+				irma.NewIssuerIdentifier("irma-demo.baz"): struct{}{},
+			},
+			CredentialTypes: map[irma.CredentialTypeIdentifier]struct{}{
+				irma.NewCredentialTypeIdentifier("irma-demo.RU.foo"):  struct{}{},
+				irma.NewCredentialTypeIdentifier("irma-demo.baz.qux"): struct{}{},
+			},
+		},
+	}
+	require.True(t, reflect.DeepEqual(expectedErr, err), "Download() returned incorrect missing identifier set")
 }
 
 // Test installing a new scheme manager from a qr, and do a(n issuance) session

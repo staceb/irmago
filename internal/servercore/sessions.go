@@ -16,12 +16,13 @@ import (
 type session struct {
 	sync.Mutex
 
-	action      irma.Action
-	token       string
-	clientToken string
-	version     *irma.ProtocolVersion
-	rrequest    irma.RequestorRequest
-	request     irma.SessionRequest
+	action           irma.Action
+	token            string
+	clientToken      string
+	version          *irma.ProtocolVersion
+	rrequest         irma.RequestorRequest
+	request          irma.SessionRequest
+	legacyCompatible bool // if the request is convertible to pre-condiscon format
 
 	status     server.Status
 	prevStatus server.Status
@@ -60,7 +61,7 @@ const (
 
 var (
 	minProtocolVersion = irma.NewVersion(2, 4)
-	maxProtocolVersion = irma.NewVersion(2, 4)
+	maxProtocolVersion = irma.NewVersion(2, 5)
 )
 
 func (s *memorySessionStore) get(t string) *session {
@@ -154,6 +155,7 @@ func (s *Server) newSession(action irma.Action, request irma.RequestorRequest) *
 		conf:        s.conf,
 		sessions:    s.sessions,
 		result: &server.SessionResult{
+			Legacy: request.SessionRequest().Base().Legacy(),
 			Token:  token,
 			Type:   action,
 			Status: server.StatusInitialized,
@@ -162,8 +164,8 @@ func (s *Server) newSession(action irma.Action, request irma.RequestorRequest) *
 
 	s.conf.Logger.WithFields(logrus.Fields{"session": ses.token}).Debug("New session started")
 	nonce, _ := gabi.RandomBigInt(gabi.DefaultSystemParameters[2048].Lstatzk)
-	ses.request.SetNonce(nonce)
-	ses.request.SetContext(one)
+	ses.request.Base().Nonce = nonce
+	ses.request.Base().Context = one
 	s.sessions.add(ses)
 
 	return ses

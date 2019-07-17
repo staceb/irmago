@@ -171,6 +171,13 @@ func (s *Server) verifyConfiguration(configuration *server.Configuration) error 
 	return nil
 }
 
+func (s *Server) validateRequest(request irma.SessionRequest) error {
+	if _, err := s.conf.IrmaConfiguration.Download(request); err != nil {
+		return err
+	}
+	return request.Disclosure().Disclose.Validate(s.conf.IrmaConfiguration)
+}
+
 func (s *Server) StartSession(req interface{}) (*irma.Qr, string, error) {
 	rrequest, err := server.ParseSessionRequest(req)
 	if err != nil {
@@ -179,6 +186,11 @@ func (s *Server) StartSession(req interface{}) (*irma.Qr, string, error) {
 
 	request := rrequest.SessionRequest()
 	action := request.Action()
+
+	if err := s.validateRequest(request); err != nil {
+		return nil, "", err
+	}
+
 	if action == irma.ActionIssuing {
 		if err := s.validateIssuanceRequest(request.(*irma.IssuanceRequest)); err != nil {
 			return nil, "", err

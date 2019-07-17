@@ -46,13 +46,13 @@ type Configuration struct {
 	// Required to be set to true if URL does not begin with https:// in production mode.
 	// In this case, the server would communicate with IRMA apps over plain HTTP. You must otherwise
 	// ensure (using eg a reverse proxy with TLS enabled) that the attributes are protected in transit.
-	DisableTLS bool
+	DisableTLS bool `json:"disable_tls" mapstructure:"disable_tls"`
 	// (Optional) email address of server admin, for incidental notifications such as breaking API changes
 	// See https://github.com/privacybydesign/irmago/tree/master/server#specifying-an-email-address
 	// for more information
 	Email string `json:"email" mapstructure:"email"`
 	// Enable server sent events for status updates (experimental; tends to hang when a reverse proxy is used)
-	EnableSSE bool
+	EnableSSE bool `json:"enable_sse" mapstructure:"enable_sse"`
 
 	// Logging verbosity level: 0 is normal, 1 includes DEBUG level, 2 includes TRACE level
 	Verbose int `json:"verbose" mapstructure:"verbose"`
@@ -75,13 +75,15 @@ type SessionPackage struct {
 // SessionResult contains session information such as the session status, type, possible errors,
 // and disclosed attributes or attribute-based signature if appropriate to the session type.
 type SessionResult struct {
-	Token       string                     `json:"token"`
-	Status      Status                     `json:"status"`
-	Type        irma.Action                `json:"type"'`
-	ProofStatus irma.ProofStatus           `json:"proofStatus,omitempty"`
-	Disclosed   []*irma.DisclosedAttribute `json:"disclosed,omitempty"`
-	Signature   *irma.SignedMessage        `json:"signature,omitempty"`
-	Err         *irma.RemoteError          `json:"error,omitempty"`
+	Token       string                       `json:"token"`
+	Status      Status                       `json:"status"`
+	Type        irma.Action                  `json:"type"'`
+	ProofStatus irma.ProofStatus             `json:"proofStatus,omitempty"`
+	Disclosed   [][]*irma.DisclosedAttribute `json:"disclosed,omitempty"`
+	Signature   *irma.SignedMessage          `json:"signature,omitempty"`
+	Err         *irma.RemoteError            `json:"error,omitempty"`
+
+	Legacy bool `json:"-"` // true if request was started with legacy (i.e. pre-condiscon) session request
 }
 
 // Status is the status of an IRMA session.
@@ -94,6 +96,28 @@ const (
 	StatusDone        Status = "DONE"        // The session has completed successfully
 	StatusTimeout     Status = "TIMEOUT"     // Session timed out
 )
+
+// Remove this when dropping support for legacy pre-condiscon session requests
+func (r *SessionResult) MarshalJSON() ([]byte, error) {
+	if !r.Legacy {
+		type tmpSessionResult SessionResult
+		return json.Marshal((*tmpSessionResult)(r))
+	}
+
+	var disclosed []*irma.DisclosedAttribute
+	for _, l := range r.Disclosed {
+		disclosed = append(disclosed, l[0])
+	}
+	return json.Marshal(struct {
+		Token       string                     `json:"token"`
+		Status      Status                     `json:"status"`
+		Type        irma.Action                `json:"type"'`
+		ProofStatus irma.ProofStatus           `json:"proofStatus,omitempty"`
+		Disclosed   []*irma.DisclosedAttribute `json:"disclosed,omitempty"`
+		Signature   *irma.SignedMessage        `json:"signature,omitempty"`
+		Err         *irma.RemoteError          `json:"error,omitempty"`
+	}{r.Token, r.Status, r.Type, r.ProofStatus, disclosed, r.Signature, r.Err})
+}
 
 func (conf *Configuration) PrivateKey(id irma.IssuerIdentifier) (sk *gabi.PrivateKey, err error) {
 	sk = conf.IssuerPrivateKeys[id]

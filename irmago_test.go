@@ -3,6 +3,7 @@ package irma
 import (
 	"encoding/json"
 	"path/filepath"
+	"reflect"
 	"testing"
 	"time"
 
@@ -147,51 +148,6 @@ func TestParseIrmaConfiguration(t *testing.T) {
 	//	"irma-demo.MijnOverheid.root had improper hash")
 }
 
-func TestAttributeDisjunctionMarshaling(t *testing.T) {
-	conf := parseConfiguration(t)
-	disjunction := AttributeDisjunction{}
-
-	var _ json.Unmarshaler = &disjunction
-	var _ json.Marshaler = &disjunction
-
-	id := NewAttributeTypeIdentifier("MijnOverheid.ageLower.over18")
-
-	attrsjson := `
-	{
-		"label": "Over 18",
-		"attributes": {
-			"MijnOverheid.ageLower.over18": "yes",
-			"Thalia.age.over18": "Yes"
-		}
-	}`
-	require.NoError(t, json.Unmarshal([]byte(attrsjson), &disjunction))
-	require.True(t, disjunction.HasValues())
-	require.Contains(t, disjunction.Attributes, id)
-	require.Contains(t, disjunction.Values, id)
-	require.Equal(t, *disjunction.Values[id], "yes")
-
-	disjunction = AttributeDisjunction{}
-	attrsjson = `
-	{
-		"label": "Over 18",
-		"attributes": [
-			"MijnOverheid.ageLower.over18",
-			"Thalia.age.over18"
-		]
-	}`
-	require.NoError(t, json.Unmarshal([]byte(attrsjson), &disjunction))
-	require.False(t, disjunction.HasValues())
-	require.Contains(t, disjunction.Attributes, id)
-
-	require.True(t, disjunction.MatchesConfig(conf))
-
-	require.False(t, disjunction.satisfied())
-	index := 0
-	disjunction.selected = &disjunction.Attributes[0]
-	disjunction.index = &index
-	require.True(t, disjunction.satisfied())
-}
-
 func TestMetadataAttribute(t *testing.T) {
 	metadata := NewMetadataAttribute(0x02)
 	if metadata.Version() != 0x02 {
@@ -239,72 +195,19 @@ func TestTimestamp(t *testing.T) {
 	require.Equal(t, time.Time(*timestruct.Time).Unix(), int64(1500000000))
 }
 
-func TestServiceProvider(t *testing.T) {
-	var spjwt ServiceProviderJwt
-
-	var spjson = `{
-		"sprequest": {
-			"validity": 60,
-			"timeout": 60,
-			"request": {
-				"content": [
-					{
-						"label": "ID",
-						"attributes": ["irma-demo.RU.studentCard.studentID"]
-					}
-				]
-			}
-		}
-	}`
-
-	require.NoError(t, json.Unmarshal([]byte(spjson), &spjwt))
-	require.NotEmpty(t, spjwt.Request.Request.Content)
-	require.NotEmpty(t, spjwt.Request.Request.Content[0])
-	require.NotEmpty(t, spjwt.Request.Request.Content[0].Attributes)
-	require.Equal(t, spjwt.Request.Request.Content[0].Attributes[0].Name(), "studentID")
-
-	require.NotNil(t, spjwt.Request.Request.Content.Find(NewAttributeTypeIdentifier("irma-demo.RU.studentCard.studentID")))
-}
-
 func TestVerifyValidSig(t *testing.T) {
 	conf := parseConfiguration(t)
 
 	irmaSignedMessageJson := "{\"signature\":[{\"c\":\"pliyrSE7wXcDcKXuBtZW5bnucvBSXpILIRvnNBgx7hQ=\",\"A\":\"D/8wLPq9860bpXZ5c+VYyoPJ+Z8CWDZNQ0jXvst8qnPRdivy/GQIfJHjVnpOPlHbguphb/7JVbfcV3bZeybA3bCF/4UesjRUZlMf/iJ/QgKHbt41ogN1PPT5z7qBJpkxuNTIkHxaUPoDvhouHmuC9pNj4afRUyLJerxKPkpdBw0=\",\"e_response\":\"YOrKTrMSs4/QOUtPkT0YaYNEmW7Cs+cu624zr2xrHodyL88ub6yaXB7MGHAcQ1+iXsGN8jkfxB/0\",\"v_response\":\"AYSa1p8ISs//MsocJjODwWuPB/z6+iKHHi+sTToRs0eJ2X1gwmWoA5QB0aHjRkWye3/+2rtosfUzI77FlPQVnrbMERwcuYM/fx3fpNCpjm2qcs3AOJRcSRxcNFMe1+4ECsmJhByMDutS1KXAAKiNvnhEXx9f0JrQGwQFtpSFPh8dOuvEKUZHAUALr4FcHCa2HL9nDRiqy2KAOxE0nAANAcMaBo/ed+WZeHtv4CTB7egyYs27cklVbwlBzmRrbjNZk57ICd0jVd6SZ2Ir93r/aPejkyhQ03xh9RVVyhOn4bkbjKIBzEybXTJAXgNmvd6F8Ds00srBZVWlo7Z23JZ7\",\"a_responses\":{\"0\":\"QHTznWWrECRNNmUNcy0yGu2L6qsZU6qkvaII8QB8QjbUxpwHzSeJWkzrn/Kk1KIowfoqB1DKGaFLATvuBl+bCoJjea+2VfK9Ns8=\",\"2\":\"H57Y9CTXJ5MAVo+aFfNSbmRMFQpraBIZVOXiRxCD/P7Aw4fW8r9P5l9pO9DTUeExaqFzsLyF5i5EridVWxlP2Wv0zbH8ku9Sg9w=\",\"3\":\"joggAmOhqM4QsKdoLHAfaslzXqJswS7MwZ/5+AKYdkMaHQ45biMdZU/6R+B7bjvsumg2f6KyTyg0G+BI+wVdJOjh3kGezdANB7Y=\",\"5\":\"5YP4A82WWeqc33e5Zg/Q8lqQQ1amLE8mOxMwCXb3N4J0UJRfV9lUFvbH1Q3Yb3YHAZpzGvhN/pBacwqktMkP4L71PnMldqA+nqA=\"},\"a_disclosed\":{\"1\":\"AgAJuwB+AALWy2qU9p3l52l9LU1rVT4M\",\"4\":\"NDU2\"}}],\"nonce\":\"Kg==\",\"context\":\"BTk=\",\"message\":\"I owe you everything\",\"timestamp\":{\"Time\":1527196489,\"ServerUrl\":\"https://metrics.privacybydesign.foundation/atum\",\"Sig\":{\"Alg\":\"ed25519\",\"Data\":\"ZV1qkvDrFK14QrUSC66xTNr9HitCOV4vwfGX0bh3iwY7qyHCi9rIOE97KY8CZifU5oLgVhFWy5E+ALR+gEpACw==\",\"PublicKey\":\"e/nMAJF7nwrvNZRpuJljNpRx+CsT7caaXyn9OX683R8=\"}}}"
 	irmaSignedMessage := &SignedMessage{}
-	json.Unmarshal([]byte(irmaSignedMessageJson), irmaSignedMessage)
-
-	request := "{\"nonce\": \"Kg==\", \"context\": \"BTk=\", \"message\":\"I owe you everything\",\"content\":[{\"label\":\"Student number (RU)\",\"attributes\":[\"irma-demo.RU.studentCard.studentID\"]}]}"
-	sigRequestJSON := []byte(request)
-	sigRequest := &SignatureRequest{}
-	json.Unmarshal(sigRequestJSON, sigRequest)
-	// Test marshalling of 'string' fields:
-	require.Equal(t, sigRequest.Nonce, big.NewInt(42))
-	require.Equal(t, sigRequest.Context, big.NewInt(1337))
-
-	// Test if we can verify it with the original request
-	var err error
-	attrs, status, err := irmaSignedMessage.Verify(conf, sigRequest)
+	err := json.Unmarshal([]byte(irmaSignedMessageJson), irmaSignedMessage)
 	require.NoError(t, err)
-	require.Equal(t, status, ProofStatusValid)
+
+	attrs, status, err := irmaSignedMessage.Verify(conf, nil)
+	require.NoError(t, err)
+	require.Equal(t, ProofStatusValid, status)
 	require.Len(t, attrs, 1)
-	require.Equal(t, attrs[0].Status, AttributeProofStatusPresent)
-	require.Equal(t, attrs[0].Value["en"], "456")
-
-	// Test verify against unmatched request (i.e. different nonce, context or message)
-	unmatched := "{\"nonce\": \"Kg==\", \"context\": \"BTk=\", \"message\":\"I owe you NOTHING\",\"content\":[{\"label\":\"Student number (RU)\",\"attributes\":[\"irma-demo.RU.studentCard.studentID\"]}]}"
-	unmatchedSigRequestJSON := []byte(unmatched)
-	unmatchedSigRequest := &SignatureRequest{}
-	json.Unmarshal(unmatchedSigRequestJSON, unmatchedSigRequest)
-	_, status, err = irmaSignedMessage.Verify(conf, unmatchedSigRequest)
-	require.NoError(t, err)
-	require.Equal(t, status, ProofStatusUnmatchedRequest)
-
-	// Test if we can also verify it without using the original request
-	attrs, status, err = irmaSignedMessage.Verify(conf, nil)
-	require.NoError(t, err)
-	require.Equal(t, status, ProofStatusValid)
-	require.Len(t, attrs, 1)
-	require.Equal(t, attrs[0].Value["en"], "456")
+	require.Equal(t, "456", attrs[0][0].Value["en"])
 }
 
 func TestVerifyInValidSig(t *testing.T) {
@@ -313,19 +216,10 @@ func TestVerifyInValidSig(t *testing.T) {
 	// Same json as valid case, but has modified c
 	irmaSignedMessageJson := "{\"signature\":[{\"c\":\"blablaE7wXcDcKXuBtZW5bnucvBSXpILIRvnNBgx7hQ=\",\"A\":\"D/8wLPq9860bpXZ5c+VYyoPJ+Z8CWDZNQ0jXvst8qnPRdivy/GQIfJHjVnpOPlHbguphb/7JVbfcV3bZeybA3bCF/4UesjRUZlMf/iJ/QgKHbt41ogN1PPT5z7qBJpkxuNTIkHxaUPoDvhouHmuC9pNj4afRUyLJerxKPkpdBw0=\",\"e_response\":\"YOrKTrMSs4/QOUtPkT0YaYNEmW7Cs+cu624zr2xrHodyL88ub6yaXB7MGHAcQ1+iXsGN8jkfxB/0\",\"v_response\":\"AYSa1p8ISs//MsocJjODwWuPB/z6+iKHHi+sTToRs0eJ2X1gwmWoA5QB0aHjRkWye3/+2rtosfUzI77FlPQVnrbMERwcuYM/fx3fpNCpjm2qcs3AOJRcSRxcNFMe1+4ECsmJhByMDutS1KXAAKiNvnhEXx9f0JrQGwQFtpSFPh8dOuvEKUZHAUALr4FcHCa2HL9nDRiqy2KAOxE0nAANAcMaBo/ed+WZeHtv4CTB7egyYs27cklVbwlBzmRrbjNZk57ICd0jVd6SZ2Ir93r/aPejkyhQ03xh9RVVyhOn4bkbjKIBzEybXTJAXgNmvd6F8Ds00srBZVWlo7Z23JZ7\",\"a_responses\":{\"0\":\"QHTznWWrECRNNmUNcy0yGu2L6qsZU6qkvaII8QB8QjbUxpwHzSeJWkzrn/Kk1KIowfoqB1DKGaFLATvuBl+bCoJjea+2VfK9Ns8=\",\"2\":\"H57Y9CTXJ5MAVo+aFfNSbmRMFQpraBIZVOXiRxCD/P7Aw4fW8r9P5l9pO9DTUeExaqFzsLyF5i5EridVWxlP2Wv0zbH8ku9Sg9w=\",\"3\":\"joggAmOhqM4QsKdoLHAfaslzXqJswS7MwZ/5+AKYdkMaHQ45biMdZU/6R+B7bjvsumg2f6KyTyg0G+BI+wVdJOjh3kGezdANB7Y=\",\"5\":\"5YP4A82WWeqc33e5Zg/Q8lqQQ1amLE8mOxMwCXb3N4J0UJRfV9lUFvbH1Q3Yb3YHAZpzGvhN/pBacwqktMkP4L71PnMldqA+nqA=\"},\"a_disclosed\":{\"1\":\"AgAJuwB+AALWy2qU9p3l52l9LU1rVT4M\",\"4\":\"NDU2\"}}],\"nonce\":\"Kg==\",\"context\":\"BTk=\",\"message\":\"I owe you everything\",\"timestamp\":{\"Time\":1527196489,\"ServerUrl\":\"https://metrics.privacybydesign.foundation/atum\",\"Sig\":{\"Alg\":\"ed25519\",\"Data\":\"ZV1qkvDrFK14QrUSC66xTNr9HitCOV4vwfGX0bh3iwY7qyHCi9rIOE97KY8CZifU5oLgVhFWy5E+ALR+gEpACw==\",\"PublicKey\":\"e/nMAJF7nwrvNZRpuJljNpRx+CsT7caaXyn9OX683R8=\"}}}"
 	irmaSignedMessage := &SignedMessage{}
-	json.Unmarshal([]byte(irmaSignedMessageJson), irmaSignedMessage)
-
-	request := "{\"nonce\": \"Kg==\", \"context\": \"BTk=\", \"message\":\"I owe you everything\",\"content\":[{\"label\":\"Student number (RU)\",\"attributes\":[\"irma-demo.RU.studentCard.studentID\"]}]}"
-	sigRequestJSON := []byte(request)
-	sigRequest := &SignatureRequest{}
-	json.Unmarshal(sigRequestJSON, sigRequest)
-
-	var err error
-	_, status, err := irmaSignedMessage.Verify(conf, sigRequest)
+	err := json.Unmarshal([]byte(irmaSignedMessageJson), irmaSignedMessage)
 	require.NoError(t, err)
-	require.Equal(t, status, ProofStatusInvalid)
 
-	_, status, err = irmaSignedMessage.Verify(conf, nil)
+	_, status, err := irmaSignedMessage.Verify(conf, nil)
 	require.NoError(t, err)
 	require.Equal(t, status, ProofStatusInvalid)
 }
@@ -336,20 +230,9 @@ func TestVerifyInValidNonce(t *testing.T) {
 	// Same json as valid case, but with modified nonce
 	irmaSignedMessageJson := "{\"signature\":[{\"c\":\"pliyrSE7wXcDcKXuBtZW5bnucvBSXpILIRvnNBgx7hQ=\",\"A\":\"D/8wLPq9860bpXZ5c+VYyoPJ+Z8CWDZNQ0jXvst8qnPRdivy/GQIfJHjVnpOPlHbguphb/7JVbfcV3bZeybA3bCF/4UesjRUZlMf/iJ/QgKHbt41ogN1PPT5z7qBJpkxuNTIkHxaUPoDvhouHmuC9pNj4afRUyLJerxKPkpdBw0=\",\"e_response\":\"YOrKTrMSs4/QOUtPkT0YaYNEmW7Cs+cu624zr2xrHodyL88ub6yaXB7MGHAcQ1+iXsGN8jkfxB/0\",\"v_response\":\"AYSa1p8ISs//MsocJjODwWuPB/z6+iKHHi+sTToRs0eJ2X1gwmWoA5QB0aHjRkWye3/+2rtosfUzI77FlPQVnrbMERwcuYM/fx3fpNCpjm2qcs3AOJRcSRxcNFMe1+4ECsmJhByMDutS1KXAAKiNvnhEXx9f0JrQGwQFtpSFPh8dOuvEKUZHAUALr4FcHCa2HL9nDRiqy2KAOxE0nAANAcMaBo/ed+WZeHtv4CTB7egyYs27cklVbwlBzmRrbjNZk57ICd0jVd6SZ2Ir93r/aPejkyhQ03xh9RVVyhOn4bkbjKIBzEybXTJAXgNmvd6F8Ds00srBZVWlo7Z23JZ7\",\"a_responses\":{\"0\":\"QHTznWWrECRNNmUNcy0yGu2L6qsZU6qkvaII8QB8QjbUxpwHzSeJWkzrn/Kk1KIowfoqB1DKGaFLATvuBl+bCoJjea+2VfK9Ns8=\",\"2\":\"H57Y9CTXJ5MAVo+aFfNSbmRMFQpraBIZVOXiRxCD/P7Aw4fW8r9P5l9pO9DTUeExaqFzsLyF5i5EridVWxlP2Wv0zbH8ku9Sg9w=\",\"3\":\"joggAmOhqM4QsKdoLHAfaslzXqJswS7MwZ/5+AKYdkMaHQ45biMdZU/6R+B7bjvsumg2f6KyTyg0G+BI+wVdJOjh3kGezdANB7Y=\",\"5\":\"5YP4A82WWeqc33e5Zg/Q8lqQQ1amLE8mOxMwCXb3N4J0UJRfV9lUFvbH1Q3Yb3YHAZpzGvhN/pBacwqktMkP4L71PnMldqA+nqA=\"},\"a_disclosed\":{\"1\":\"AgAJuwB+AALWy2qU9p3l52l9LU1rVT4M\",\"4\":\"NDU2\"}}],\"nonce\":\"aa==\",\"context\":\"BTk=\",\"message\":\"I owe you everything\",\"timestamp\":{\"Time\":1527196489,\"ServerUrl\":\"https://metrics.privacybydesign.foundation/atum\",\"Sig\":{\"Alg\":\"ed25519\",\"Data\":\"ZV1qkvDrFK14QrUSC66xTNr9HitCOV4vwfGX0bh3iwY7qyHCi9rIOE97KY8CZifU5oLgVhFWy5E+ALR+gEpACw==\",\"PublicKey\":\"e/nMAJF7nwrvNZRpuJljNpRx+CsT7caaXyn9OX683R8=\"}}}"
 	irmaSignedMessage := &SignedMessage{}
-	json.Unmarshal([]byte(irmaSignedMessageJson), irmaSignedMessage)
+	require.NoError(t, json.Unmarshal([]byte(irmaSignedMessageJson), irmaSignedMessage))
 
-	// Original request also has the same invalid nonce (otherwise we would get unmatched_request)
-	request := "{\"nonce\": \"aa==\", \"context\": \"BTk=\", \"message\":\"I owe you everything\",\"content\":[{\"label\":\"Student number (RU)\",\"attributes\":[\"irma-demo.RU.studentCard.studentID\"]}]}"
-	sigRequestJSON := []byte(request)
-	sigRequest := &SignatureRequest{}
-	json.Unmarshal(sigRequestJSON, sigRequest)
-
-	var err error
-	_, status, err := irmaSignedMessage.Verify(conf, sigRequest)
-	require.NoError(t, err)
-	require.Equal(t, status, ProofStatusInvalid)
-
-	_, status, err = irmaSignedMessage.Verify(conf, nil)
+	_, status, err := irmaSignedMessage.Verify(conf, nil)
 	require.NoError(t, err)
 	require.Equal(t, status, ProofStatusInvalid)
 }
@@ -371,4 +254,269 @@ func TestAttributeDecoding(t *testing.T) {
 	oldAttribute, _ := new(big.Int).SetString("1835101285", 10)
 	oldString := decodeAttribute(oldAttribute, 2)
 	require.Equal(t, *oldString, expected)
+}
+
+func TestSessionRequests(t *testing.T) {
+	attrval := "hello"
+	sigMessage := "message to be signed"
+
+	base := &DisclosureRequest{
+		BaseRequest: BaseRequest{LDContext: LDContextDisclosureRequest},
+		Disclose: AttributeConDisCon{
+			AttributeDisCon{
+				AttributeCon{NewAttributeRequest("irma-demo.MijnOverheid.ageLimits.over18")},
+				AttributeCon{NewAttributeRequest("irma-demo.MijnOverheid.ageLimits.over21")},
+			},
+			AttributeDisCon{
+				AttributeCon{AttributeRequest{Type: NewAttributeTypeIdentifier("irma-demo.MijnOverheid.fullName.firstname"), Value: &attrval}},
+			},
+		},
+		Labels: map[int]TranslatedString{0: trivialTranslation("Age limit"), 1: trivialTranslation("First name")},
+	}
+
+	tests := []struct {
+		oldJson, currentJson   string
+		old, current, expected SessionRequest
+	}{
+		{
+			expected: base,
+			old:      &DisclosureRequest{},
+			oldJson: `{
+				"type": "disclosing",
+				"content": [{
+					"label": "Age limit",
+					"attributes": [
+						"irma-demo.MijnOverheid.ageLimits.over18",
+						"irma-demo.MijnOverheid.ageLimits.over21"
+					]
+				},
+				{
+					"label": "First name",
+					"attributes": {
+						"irma-demo.MijnOverheid.fullName.firstname": "hello"
+					}
+				}]
+			}`,
+			current: &DisclosureRequest{},
+			currentJson: `{
+				"@context": "https://irma.app/ld/request/disclosure/v2",
+				"disclose": [
+					[
+						[
+							"irma-demo.MijnOverheid.ageLimits.over18"
+						],
+						[
+							"irma-demo.MijnOverheid.ageLimits.over21"
+						]
+					],
+					[
+						[
+							{ "type": "irma-demo.MijnOverheid.fullName.firstname", "value": "hello" }
+						]
+					]
+				],
+				"labels": {
+					"0": {
+						"en": "Age limit",
+						"nl": "Age limit"
+					},
+					"1": {
+						"en": "First name",
+						"nl": "First name"
+					}
+				}
+			}`,
+		},
+
+		{
+			expected: &SignatureRequest{
+				DisclosureRequest{BaseRequest{LDContext: LDContextSignatureRequest}, base.Disclose, base.Labels},
+				sigMessage,
+			},
+			old: &SignatureRequest{},
+			oldJson: `{
+				"type": "signing",
+				"message": "message to be signed",
+				"content": [{
+					"label": "Age limit",
+					"attributes": [
+						"irma-demo.MijnOverheid.ageLimits.over18",
+						"irma-demo.MijnOverheid.ageLimits.over21"
+					]
+				},
+				{
+					"label": "First name",
+					"attributes": {
+						"irma-demo.MijnOverheid.fullName.firstname": "hello"
+					}
+				}]
+			}`,
+			current: &SignatureRequest{},
+			currentJson: `{
+				"@context": "https://irma.app/ld/request/signature/v2",
+				"disclose": [
+					[
+						[
+							"irma-demo.MijnOverheid.ageLimits.over18"
+						],
+						[
+							"irma-demo.MijnOverheid.ageLimits.over21"
+						]
+					],
+					[
+						[
+							{ "type": "irma-demo.MijnOverheid.fullName.firstname", "value": "hello" }
+						]
+					]
+				],
+				"labels": {
+					"0": {
+						"en": "Age limit",
+						"nl": "Age limit"
+					},
+					"1": {
+						"en": "First name",
+						"nl": "First name"
+					}
+				},
+				"message": "message to be signed"
+			}`,
+		},
+
+		{
+			expected: &IssuanceRequest{
+				DisclosureRequest: DisclosureRequest{BaseRequest{LDContext: LDContextIssuanceRequest}, base.Disclose, base.Labels},
+				Credentials: []*CredentialRequest{
+					{
+						CredentialTypeID: NewCredentialTypeIdentifier("irma-demo.MijnOverheid.root"),
+						Attributes:       map[string]string{"BSN": "12345"},
+					},
+				},
+			},
+			old: &IssuanceRequest{},
+			oldJson: `{
+				"type": "issuing",
+				"credentials": [{
+					"credential": "irma-demo.MijnOverheid.root",
+					"attributes": { "BSN": "12345" }
+				}],
+				"disclose": [{
+					"label": "Age limit",
+					"attributes": [
+						"irma-demo.MijnOverheid.ageLimits.over18",
+						"irma-demo.MijnOverheid.ageLimits.over21"
+					]
+				},
+				{
+					"label": "First name",
+					"attributes": {
+						"irma-demo.MijnOverheid.fullName.firstname": "hello"
+					}
+				}]
+			}`,
+			current: &IssuanceRequest{},
+			currentJson: `{
+				"@context": "https://irma.app/ld/request/issuance/v2",
+				"credentials": [
+					{
+						"credential": "irma-demo.MijnOverheid.root",
+						"attributes": {
+							"BSN": "12345"
+						}
+					}
+				],
+				"disclose": [
+					[
+						[
+							"irma-demo.MijnOverheid.ageLimits.over18"
+						],
+						[
+							"irma-demo.MijnOverheid.ageLimits.over21"
+						]
+					],
+					[
+						[
+							{ "type": "irma-demo.MijnOverheid.fullName.firstname", "value": "hello" }
+						]
+					]
+				],
+				"labels": {
+					"0": {
+						"en": "Age limit",
+						"nl": "Age limit"
+					},
+					"1": {
+						"en": "First name",
+						"nl": "First name"
+					}
+				}
+			}`,
+		},
+	}
+
+	for _, tst := range tests {
+		require.NoError(t, json.Unmarshal([]byte(tst.oldJson), tst.old))
+		require.NoError(t, json.Unmarshal([]byte(tst.currentJson), tst.current))
+		tst.old.Base().legacy = false // We don't care about this field differing, override it
+		tst.old.Base().Type = ""      // same
+		require.True(t, reflect.DeepEqual(tst.old, tst.expected), "Legacy %s did not unmarshal to expected value", reflect.TypeOf(tst.old).String())
+		require.True(t, reflect.DeepEqual(tst.current, tst.expected), "%s did not unmarshal to expected value", reflect.TypeOf(tst.old).String())
+
+		_, err := tst.expected.Legacy()
+		require.NoError(t, err)
+	}
+}
+
+func trivialTranslation(str string) TranslatedString {
+	return TranslatedString{"en": str, "nl": str}
+}
+
+func TestConDisconSingletons(t *testing.T) {
+	tests := []struct {
+		attrs   AttributeConDisCon
+		allowed bool
+	}{
+		{
+			AttributeConDisCon{
+				AttributeDisCon{
+					AttributeCon{
+						NewAttributeRequest("irma-demo.RU.studentCard.studentID"), // non singleton
+						NewAttributeRequest("test.test.email.email"),              // non singleton
+					},
+				},
+			},
+			false, // multiple non-singletons in one inner conjunction is not allowed
+		},
+		{
+			AttributeConDisCon{
+				AttributeDisCon{
+					AttributeCon{
+						NewAttributeRequest("irma-demo.RU.studentCard.studentID"), // non singleton
+						NewAttributeRequest("test.test.mijnirma.email"),           // singleton
+					},
+				},
+			},
+			true,
+		},
+		{
+			AttributeConDisCon{
+				AttributeDisCon{
+					AttributeCon{
+						NewAttributeRequest("irma-demo.MijnOverheid.root.BSN"), // singleton
+						NewAttributeRequest("test.test.mijnirma.email"),        // singleton
+					},
+				},
+			},
+			true,
+		},
+	}
+
+	conf := parseConfiguration(t)
+	for _, args := range tests {
+		if args.allowed {
+			require.NoError(t, args.attrs.Validate(conf))
+		} else {
+			require.Error(t, args.attrs.Validate(conf))
+		}
+	}
 }

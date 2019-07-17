@@ -12,6 +12,7 @@ import (
 	"github.com/privacybydesign/irmago/server/requestorserver"
 	"github.com/sirupsen/logrus"
 	"github.com/stretchr/testify/require"
+	"github.com/x-cray/logrus-prefixed-formatter"
 )
 
 var (
@@ -25,7 +26,7 @@ var (
 
 func init() {
 	logger.Level = logrus.ErrorLevel
-	logger.Formatter = &logrus.TextFormatter{}
+	logger.Formatter = &prefixed.TextFormatter{ForceFormatting: true, ForceColors: true}
 }
 
 func StartRequestorServer(configuration *requestorserver.Configuration) {
@@ -45,8 +46,12 @@ func StopRequestorServer() {
 	requestorServer.Stop()
 }
 
-func StartIrmaServer(t *testing.T) {
+func StartIrmaServer(t *testing.T, updatedIrmaConf bool) {
 	testdata := test.FindTestdataFolder(t)
+	irmaconf := "irma_configuration"
+	if updatedIrmaConf {
+		irmaconf += "_updated"
+	}
 
 	logger := logrus.New()
 	logger.Level = logrus.ErrorLevel
@@ -54,10 +59,9 @@ func StartIrmaServer(t *testing.T) {
 
 	var err error
 	irmaServer, err = irmaserver.New(&server.Configuration{
-		URL:                   "http://localhost:48680",
-		Logger:                logger,
-		SchemesPath:           filepath.Join(testdata, "irma_configuration"),
-		IssuerPrivateKeysPath: filepath.Join(testdata, "privatekeys"),
+		URL:         "http://localhost:48680",
+		Logger:      logger,
+		SchemesPath: filepath.Join(testdata, irmaconf),
 	})
 
 	require.NoError(t, err)

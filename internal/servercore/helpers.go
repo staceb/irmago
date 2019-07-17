@@ -129,14 +129,20 @@ func (session *session) eventSource() eventsource.EventSource {
 
 // Other
 
-func chooseProtocolVersion(min, max *irma.ProtocolVersion) (*irma.ProtocolVersion, error) {
-	if min.AboveVersion(maxProtocolVersion) || max.BelowVersion(minProtocolVersion) || max.BelowVersion(min) {
-		return nil, server.LogWarning(errors.Errorf("Protocol version negotiation failed, min=%s max=%s", min.String(), max.String()))
+func (session *session) chooseProtocolVersion(minClient, maxClient *irma.ProtocolVersion) (*irma.ProtocolVersion, error) {
+	// Set our minimum supported version to 2.5 if condiscon compatibility is required
+	minServer := minProtocolVersion
+	if !session.legacyCompatible {
+		minServer = &irma.ProtocolVersion{2, 5}
 	}
-	if max.AboveVersion(maxProtocolVersion) {
+
+	if minClient.AboveVersion(maxProtocolVersion) || maxClient.BelowVersion(minServer) || maxClient.BelowVersion(minClient) {
+		return nil, server.LogWarning(errors.Errorf("Protocol version negotiation failed, min=%s max=%s minServer=%s maxServer=%s", minClient.String(), maxClient.String(), minServer.String(), maxProtocolVersion.String()))
+	}
+	if maxClient.AboveVersion(maxProtocolVersion) {
 		return maxProtocolVersion, nil
 	} else {
-		return max, nil
+		return maxClient, nil
 	}
 }
 
@@ -153,10 +159,13 @@ func purgeRequest(request irma.RequestorRequest) irma.RequestorRequest {
 	_ = json.Unmarshal(bts, cpy)
 
 	// Remove required attribute values from any attributes to be disclosed
-	attrs := cpy.(irma.RequestorRequest).SessionRequest().ToDisclose()
-	for _, disjunction := range attrs {
-		disjunction.Values = nil
-	}
+	_ = cpy.(irma.RequestorRequest).SessionRequest().Disclosure().Disclose.Iterate(
+		func(attr *irma.AttributeRequest) error {
+			attr.Value = nil
+			return nil
+		},
+	)
+
 	// Remove attribute values from attributes to be issued
 	if isreq, ok := cpy.(*irma.IdentityProviderRequest); ok {
 		for _, cred := range isreq.Request.Credentials {

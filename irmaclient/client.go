@@ -4,6 +4,7 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/bwesterb/go-atum"
 	"github.com/getsentry/raven-go"
 	"github.com/go-errors/errors"
 	"github.com/privacybydesign/gabi"
@@ -91,6 +92,14 @@ type ClientHandler interface {
 	UpdateConfiguration(new *irma.IrmaIdentifierSet)
 	UpdateAttributes()
 }
+
+// MissingAttributes contains all attribute requests that the client cannot satisfy with its
+// current attributes.
+type MissingAttributes map[int]map[int]map[int]MissingAttribute
+
+// MissingAttribute is an irma.AttributeRequest that is satisfied by none of the client's attributes
+// (with Go's default JSON marshaler instead of that of irma.AttributeRequest).
+type MissingAttribute irma.AttributeRequest
 
 type secretKey struct {
 	Key *big.Int
@@ -310,7 +319,7 @@ func (client *Client) RemoveAllCredentials() error {
 			if attrs.CredentialType() != nil {
 				removed[attrs.CredentialType().Identifier()] = attrs.Strings()
 			}
-			client.storage.DeleteSignature(attrs)
+			_ = client.storage.DeleteSignature(attrs)
 		}
 	}
 	client.attributes = map[irma.CredentialTypeIdentifier][]*irma.AttributeList{}
@@ -360,14 +369,22 @@ func (client *Client) Attributes(id irma.CredentialTypeIdentifier, counter int) 
 	return list[counter]
 }
 
-func (client *Client) credentialByHash(hash string) (*credential, int, error) {
+func (client *Client) attributesByHash(hash string) (*irma.AttributeList, int) {
 	for _, attrlistlist := range client.attributes {
 		for index, attrs := range attrlistlist {
 			if attrs.Hash() == hash {
-				cred, err := client.credential(attrs.CredentialType().Identifier(), index)
-				return cred, index, err
+				return attrs, index
 			}
 		}
+	}
+	return nil, 0
+}
+
+func (client *Client) credentialByHash(hash string) (*credential, int, error) {
+	attrs, index := client.attributesByHash(hash)
+	if attrs != nil {
+		cred, err := client.credential(attrs.CredentialType().Identifier(), index)
+		return cred, index, err
 	}
 	return nil, 0, nil
 }
@@ -425,64 +442,172 @@ func (client *Client) credential(id irma.CredentialTypeIdentifier, counter int) 
 
 // Methods used in the IRMA protocol
 
-// Candidates returns a list of attributes present in this client
-// that satisfy the specified attribute disjunction.
-func (client *Client) Candidates(disjunction *irma.AttributeDisjunction) []*irma.AttributeIdentifier {
-	candidates := make([]*irma.AttributeIdentifier, 0, 10)
-
-	for _, attribute := range disjunction.Attributes {
-		credID := attribute.CredentialTypeIdentifier()
-		if !client.Configuration.Contains(credID) {
-			continue
+// credCandidates returns a list containing a list of candidate credential instances for each item
+// in the conjunction. (A credential instance from the client is a candidate it it contains
+// attributes required in this conjunction). If one credential type occurs multiple times in the
+// conjunction it is not added twice.
+func (client *Client) credCandidates(con irma.AttributeCon) credCandidateSet {
+	var candidates [][]*irma.CredentialIdentifier
+	for _, credtype := range con.CredentialTypes() {
+		creds := client.attributes[credtype]
+		if len(creds) == 0 {
+			return nil // we'll need at least one instance of each credtype in this conjunction
 		}
-		creds := client.attributes[credID]
-		count := len(creds)
-		if count == 0 {
-			continue
-		}
-		for _, attrs := range creds {
-			if !attrs.IsValid() {
+		var c []*irma.CredentialIdentifier
+		for _, cred := range creds {
+			if !cred.IsValid() {
 				continue
 			}
-			id := &irma.AttributeIdentifier{Type: attribute, CredentialHash: attrs.Hash()}
-			if attribute.IsCredential() {
-				candidates = append(candidates, id)
-			} else {
-				val := attrs.UntranslatedAttribute(attribute)
-				if val == nil {
+			c = append(c, &irma.CredentialIdentifier{Type: credtype, Hash: cred.Hash()})
+		}
+		candidates = append(candidates, c)
+	}
+	return candidates
+}
+
+type credCandidateSet [][]*irma.CredentialIdentifier
+
+func (set credCandidateSet) multiply(candidates []*irma.CredentialIdentifier) credCandidateSet {
+	result := make(credCandidateSet, 0, len(set)*len(candidates))
+	for _, cred := range candidates {
+		for _, toDisclose := range set {
+			result = append(result, append(toDisclose, cred))
+		}
+	}
+	return result
+}
+
+func (set credCandidateSet) expand(client *Client, con irma.AttributeCon) [][]*irma.AttributeIdentifier {
+	var result [][]*irma.AttributeIdentifier
+
+outer:
+	for _, s := range set {
+		var candidateSet []*irma.AttributeIdentifier
+		for _, cred := range s {
+			for _, attr := range con {
+				if attr.Type.CredentialTypeIdentifier() != cred.Type {
 					continue
 				}
-				if !disjunction.HasValues() {
-					candidates = append(candidates, id)
-				} else {
-					requiredValue, present := disjunction.Values[attribute]
-					if !present || requiredValue == nil || *val == *requiredValue {
-						candidates = append(candidates, id)
-					}
+				attrs, _ := client.attributesByHash(cred.Hash)
+				val := attrs.UntranslatedAttribute(attr.Type)
+				if !attr.Satisfy(attr.Type, val) {
+					// if the attribute in this credential instance has the wrong value, then we have
+					// to discard the entire candidate set
+					continue outer
+				}
+				candidateSet = append(candidateSet, &irma.AttributeIdentifier{
+					Type:           attr.Type,
+					CredentialHash: cred.Hash,
+				})
+			}
+		}
+		result = append(result, candidateSet)
+	}
+
+	return result
+}
+
+func cartesianProduct(candidates [][]*irma.CredentialIdentifier) credCandidateSet {
+	set := credCandidateSet{[]*irma.CredentialIdentifier{}} // Unit element for this multiplication
+	for _, c := range candidates {
+		set = set.multiply(c)
+	}
+	return set
+}
+
+// Candidates returns attributes present in this client that satisfy the specified attribute
+// disjunction. It returns a list of candidate attribute sets, each of which would satisfy the
+// specified disjunction. If the disjunction cannot be satisfied by the attributes that the client
+// currently posesses (ie. len(candidates) == 0), then the second return parameter lists the missing
+// attributes that would be necessary to satisfy the disjunction.
+func (client *Client) Candidates(discon irma.AttributeDisCon) (
+	candidates [][]*irma.AttributeIdentifier, missing map[int]map[int]MissingAttribute,
+) {
+	candidates = [][]*irma.AttributeIdentifier{}
+
+	for _, con := range discon {
+		if len(con) == 0 {
+			// An empty conjunction means the containing disjunction is optional
+			// so it is satisfied by sending no attributes
+			candidates = append(candidates, []*irma.AttributeIdentifier{})
+			continue
+		}
+
+		// Build a list containing, for each attribute in this conjunction, a list of credential
+		// instances containing the attribute. Writing schematically a sample conjunction of three
+		// attribute types as [ a.a.a.a, a.a.a.b, a.a.b.x ], we map this to:
+		// [ [ a.a.a #1, a.a.a #2] , [ a.a.b #1 ] ]
+		// assuming the client has 2 instances of a.a.a and 1 instance of a.a.b.
+		c := client.credCandidates(con)
+		if len(c) == 0 {
+			continue
+		}
+
+		// The cartesian product of the list of lists constructed above results in a list of which
+		// each item is a list of credentials containing attributes that together will satisfy the
+		// current conjunction
+		// [ [ a.a.a #1, a.a.b #1 ], [ a.a.a #2, a.a.b #1 ] ]
+		c = cartesianProduct(c)
+
+		// Expand each credential instance to those attribute instances within it that the con
+		// is asking for, resulting in attribute sets each of which would satisfy the conjunction,
+		// and therefore the containing disjunction
+		// [ [ a.a.a.a #1, a.a.a.b #1, a.a.b.x #1 ], [ a.a.a.a #2, a.a.a.b #2, a.a.b.x #1 ] ]
+		candidates = append(candidates, c.expand(client, con)...)
+	}
+
+	if len(candidates) == 0 {
+		missing = client.missingAttributes(discon)
+	}
+
+	return
+}
+
+// missingAttributes returns for each of the conjunctions in the specified disjunction
+// a list of attributes that the client does not posess but which would be required to
+// satisfy the conjunction.
+func (client *Client) missingAttributes(discon irma.AttributeDisCon) map[int]map[int]MissingAttribute {
+	missing := make(map[int]map[int]MissingAttribute, len(discon))
+
+	for i, con := range discon {
+		missing[i] = map[int]MissingAttribute{}
+	conloop:
+		for j, req := range con {
+			creds := client.attributes[req.Type.CredentialTypeIdentifier()]
+			if len(creds) == 0 {
+				missing[i][j] = MissingAttribute(req)
+				continue
+			}
+			for _, cred := range creds {
+				if req.Satisfy(req.Type, cred.UntranslatedAttribute(req.Type)) {
+					continue conloop
 				}
 			}
+			missing[i][j] = MissingAttribute(req)
 		}
 	}
 
-	return candidates
+	return missing
 }
 
 // CheckSatisfiability checks if this client has the required attributes
 // to satisfy the specifed disjunction list. If not, the unsatisfiable disjunctions
 // are returned.
-func (client *Client) CheckSatisfiability(
-	disjunctions irma.AttributeDisjunctionList,
-) ([][]*irma.AttributeIdentifier, irma.AttributeDisjunctionList) {
-	candidates := [][]*irma.AttributeIdentifier{}
-	missing := irma.AttributeDisjunctionList{}
-	for i, disjunction := range disjunctions {
-		candidates = append(candidates, []*irma.AttributeIdentifier{})
-		candidates[i] = client.Candidates(disjunction)
+func (client *Client) CheckSatisfiability(condiscon irma.AttributeConDisCon) (
+	candidates [][][]*irma.AttributeIdentifier, missing MissingAttributes,
+) {
+	candidates = make([][][]*irma.AttributeIdentifier, len(condiscon))
+	missing = MissingAttributes{}
+
+	for i, discon := range condiscon {
+		var m map[int]map[int]MissingAttribute
+		candidates[i], m = client.Candidates(discon)
 		if len(candidates[i]) == 0 {
-			missing = append(missing, disjunction)
+			missing[i] = m
 		}
 	}
-	return candidates, missing
+
+	return
 }
 
 // attributeGroup points to a credential and some of its attributes which are to be disclosed
@@ -504,60 +629,60 @@ func (client *Client) groupCredentials(choice *irma.DisclosureChoice) (
 	credIndices := make(map[irma.CredentialIdentifier]int)
 	todisclose := make([]attributeGroup, 0, len(choice.Attributes))
 	attributeIndices := make(irma.DisclosedAttributeIndices, len(choice.Attributes))
-	for i, attribute := range choice.Attributes {
-		var credIndex int
-		ici := attribute.CredentialIdentifier()
-		if _, present := credIndices[ici]; !present {
-			credIndex = len(todisclose)
-			credIndices[ici] = credIndex
-			todisclose = append(todisclose, attributeGroup{
-				cred: ici, attrs: []int{1}, // Always disclose metadata
-			})
-		} else {
-			credIndex = credIndices[ici]
-		}
-
-		identifier := attribute.Type
-		if identifier.IsCredential() {
-			attributeIndices[i] = []*irma.DisclosedAttributeIndex{
-				{CredentialIndex: credIndex, AttributeIndex: 1, Identifier: ici},
+	for i, attributeset := range choice.Attributes {
+		attributeIndices[i] = []*irma.DisclosedAttributeIndex{}
+		for _, attribute := range attributeset {
+			var credIndex int
+			ici := attribute.CredentialIdentifier()
+			if _, present := credIndices[ici]; !present {
+				credIndex = len(todisclose)
+				credIndices[ici] = credIndex
+				todisclose = append(todisclose, attributeGroup{
+					cred: ici, attrs: []int{1}, // Always disclose metadata
+				})
+			} else {
+				credIndex = credIndices[ici]
 			}
-			continue // In this case we only disclose the metadata attribute, which is already handled above
-		}
 
-		attrIndex, err := client.Configuration.CredentialTypes[identifier.CredentialTypeIdentifier()].IndexOf(identifier)
-		if err != nil {
-			return nil, nil, err
+			identifier := attribute.Type
+			if identifier.IsCredential() {
+				attributeIndices[i] = append(attributeIndices[i], &irma.DisclosedAttributeIndex{CredentialIndex: credIndex, AttributeIndex: 1, Identifier: ici})
+				continue // In this case we only disclose the metadata attribute, which is already handled above
+			}
+
+			attrIndex, err := client.Configuration.CredentialTypes[identifier.CredentialTypeIdentifier()].IndexOf(identifier)
+			if err != nil {
+				return nil, nil, err
+			}
+			// These attribute indices will be used in the []*big.Int at gabi.credential.Attributes,
+			// which doesn't know about the secret key and metadata attribute, so +2
+			attributeIndices[i] = append(attributeIndices[i], &irma.DisclosedAttributeIndex{CredentialIndex: credIndex, AttributeIndex: attrIndex + 2, Identifier: ici})
+			todisclose[credIndex].attrs = append(todisclose[credIndex].attrs, attrIndex+2)
 		}
-		// These attribute indices will be used in the []*big.Int at gabi.credential.Attributes,
-		// which doesn't know about the secret key and metadata attribute, so +2
-		attributeIndices[i] = []*irma.DisclosedAttributeIndex{
-			{CredentialIndex: credIndex, AttributeIndex: attrIndex + 2, Identifier: ici},
-		}
-		todisclose[credIndex].attrs = append(todisclose[credIndex].attrs, attrIndex+2)
 	}
 
 	return todisclose, attributeIndices, nil
 }
 
 // ProofBuilders constructs a list of proof builders for the specified attribute choice.
-func (client *Client) ProofBuilders(choice *irma.DisclosureChoice, request irma.SessionRequest, issig bool,
-) (gabi.ProofBuilderList, irma.DisclosedAttributeIndices, error) {
+func (client *Client) ProofBuilders(choice *irma.DisclosureChoice, request irma.SessionRequest,
+) (gabi.ProofBuilderList, irma.DisclosedAttributeIndices, *atum.Timestamp, error) {
 	todisclose, attributeIndices, err := client.groupCredentials(choice)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 
-	builders := gabi.ProofBuilderList([]gabi.ProofBuilder{})
+	var builders gabi.ProofBuilderList
 	for _, grp := range todisclose {
 		cred, err := client.credentialByID(grp.cred)
 		if err != nil {
-			return nil, nil, err
+			return nil, nil, nil, err
 		}
 		builders = append(builders, cred.Credential.CreateDisclosureProofBuilder(grp.attrs))
 	}
 
-	if issig {
+	var timestamp *atum.Timestamp
+	if r, ok := request.(*irma.SignatureRequest); ok {
 		var sigs []*big.Int
 		var disclosed [][]*big.Int
 		var s *big.Int
@@ -567,27 +692,27 @@ func (client *Client) ProofBuilders(choice *irma.DisclosureChoice, request irma.
 			sigs = append(sigs, s)
 			disclosed = append(disclosed, d)
 		}
-		r := request.(*irma.SignatureRequest)
-		r.Timestamp, err = irma.GetTimestamp(r.Message, sigs, disclosed)
+		timestamp, err = irma.GetTimestamp(r.Message, sigs, disclosed, client.Configuration)
 		if err != nil {
-			return nil, nil, err
+			return nil, nil, nil, err
 		}
 	}
 
-	return builders, attributeIndices, nil
+	return builders, attributeIndices, timestamp, nil
 }
 
 // Proofs computes disclosure proofs containing the attributes specified by choice.
-func (client *Client) Proofs(choice *irma.DisclosureChoice, request irma.SessionRequest, issig bool) (*irma.Disclosure, error) {
-	builders, choices, err := client.ProofBuilders(choice, request, issig)
+func (client *Client) Proofs(choice *irma.DisclosureChoice, request irma.SessionRequest) (*irma.Disclosure, *atum.Timestamp, error) {
+	builders, choices, timestamp, err := client.ProofBuilders(choice, request)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
+	_, issig := request.(*irma.SignatureRequest)
 	return &irma.Disclosure{
-		Proofs:  builders.BuildProofList(request.GetContext(), request.GetNonce(), issig),
+		Proofs:  builders.BuildProofList(request.Base().GetContext(), request.GetNonce(timestamp), issig),
 		Indices: choices,
-	}, nil
+	}, timestamp, nil
 }
 
 // generateIssuerProofNonce generates a nonce which the issuer must use in its gabi.ProofS.
@@ -598,7 +723,7 @@ func generateIssuerProofNonce() (*big.Int, error) {
 // IssuanceProofBuilders constructs a list of proof builders in the issuance protocol
 // for the future credentials as well as possibly any disclosed attributes, and generates
 // a nonce against which the issuer's proof of knowledge must verify.
-func (client *Client) IssuanceProofBuilders(request *irma.IssuanceRequest,
+func (client *Client) IssuanceProofBuilders(request *irma.IssuanceRequest, choice *irma.DisclosureChoice,
 ) (gabi.ProofBuilderList, irma.DisclosedAttributeIndices, *big.Int, error) {
 	issuerProofNonce, err := generateIssuerProofNonce()
 	if err != nil {
@@ -616,7 +741,7 @@ func (client *Client) IssuanceProofBuilders(request *irma.IssuanceRequest,
 		builders = append(builders, credBuilder)
 	}
 
-	disclosures, choices, err := client.ProofBuilders(request.Choice, request, false)
+	disclosures, choices, _, err := client.ProofBuilders(choice, request)
 	if err != nil {
 		return nil, nil, nil, err
 	}
@@ -626,15 +751,15 @@ func (client *Client) IssuanceProofBuilders(request *irma.IssuanceRequest,
 
 // IssueCommitments computes issuance commitments, along with disclosure proofs specified by choice,
 // and also returns the credential builders which will become the new credentials upon combination with the issuer's signature.
-func (client *Client) IssueCommitments(request *irma.IssuanceRequest,
+func (client *Client) IssueCommitments(request *irma.IssuanceRequest, choice *irma.DisclosureChoice,
 ) (*irma.IssueCommitmentMessage, gabi.ProofBuilderList, error) {
-	builders, choices, issuerProofNonce, err := client.IssuanceProofBuilders(request)
+	builders, choices, issuerProofNonce, err := client.IssuanceProofBuilders(request, choice)
 	if err != nil {
 		return nil, nil, err
 	}
 	return &irma.IssueCommitmentMessage{
 		IssueCommitmentMessage: &gabi.IssueCommitmentMessage{
-			Proofs: builders.BuildProofList(request.GetContext(), request.GetNonce(), false),
+			Proofs: builders.BuildProofList(request.GetContext(), request.GetNonce(nil), false),
 			Nonce2: issuerProofNonce,
 		},
 		Indices: choices,
@@ -659,7 +784,7 @@ func (client *Client) ConstructCredentials(msg []*gabi.IssueSignatureMessage, re
 			continue
 		}
 		sig := msg[i-offset]
-		attrs, err := request.Credentials[i-offset].AttributeList(client.Configuration, irma.GetMetadataVersion(request.GetVersion()))
+		attrs, err := request.Credentials[i-offset].AttributeList(client.Configuration, irma.GetMetadataVersion(request.Base().ProtocolVersion))
 		if err != nil {
 			return err
 		}
@@ -871,4 +996,47 @@ func (client *Client) applyPreferences() {
 	} else {
 		raven.SetDSN("")
 	}
+}
+
+// ConfigurationUpdated should be run after Configuration.Download().
+// For any credential type in the updated scheme to which new attributes were added, this function
+// sets the value of these new attributes to 0 in all instances that the client currently has of this
+// credential type.
+func (client *Client) ConfigurationUpdated(downloaded *irma.IrmaIdentifierSet) error {
+	if downloaded == nil || len(downloaded.CredentialTypes) == 0 {
+		return nil
+	}
+
+	var contains bool
+	for id := range downloaded.CredentialTypes {
+		if _, contains = client.attributes[id]; !contains {
+			continue
+		}
+		for i := range client.attributes[id] {
+			attrs := client.attributes[id][i].Ints
+			diff := len(client.Configuration.CredentialTypes[id].AttributeTypes) - (len(attrs) - 1)
+			if diff <= 0 {
+				continue
+			}
+			attrs = append(attrs, make([]*big.Int, diff, diff)...)
+			for j := len(attrs) - diff; j < len(attrs); j++ {
+				attrs[j] = big.NewInt(0)
+			}
+			client.attributes[id][i].Ints = attrs
+
+			if _, contains = client.credentialsCache[id]; !contains {
+				continue
+			}
+			if _, contains = client.credentialsCache[id][i]; !contains {
+				continue
+			}
+			client.credentialsCache[id][i].Attributes = append(
+				client.credentialsCache[id][i].Attributes[:1],
+				attrs...,
+			)
+			client.credentialsCache[id][i].attrs = nil
+		}
+	}
+
+	return client.storage.StoreAttributes(client.attributes)
 }

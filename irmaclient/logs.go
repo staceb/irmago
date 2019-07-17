@@ -20,9 +20,10 @@ type LogEntry struct {
 	request irma.SessionRequest // cached parsed version of Request; get with LogEntry.SessionRequest()
 
 	// Session type-specific info
-	Removed       map[irma.CredentialTypeIdentifier][]irma.TranslatedString `json:",omitempty"` // In case of credential removal
-	SignedMessage []byte                                                    `json:",omitempty"` // In case of signature sessions
-	Timestamp     *atum.Timestamp                                           `json:",omitempty"` // In case of signature sessions
+	Removed                map[irma.CredentialTypeIdentifier][]irma.TranslatedString `json:",omitempty"` // In case of credential removal
+	SignedMessage          []byte                                                    `json:",omitempty"` // In case of signature sessions
+	Timestamp              *atum.Timestamp                                           `json:",omitempty"` // In case of signature sessions
+	SignedMessageLDContext string                                                    `json:",omitempty"` // In case of signature sessions
 
 	IssueCommitment *irma.IssueCommitmentMessage `json:",omitempty"`
 	Disclosure      *irma.Disclosure             `json:",omitempty"`
@@ -62,9 +63,9 @@ func (entry *LogEntry) setSessionRequest() error {
 }
 
 // GetDisclosedCredentials gets the list of disclosed credentials for a log entry
-func (entry *LogEntry) GetDisclosedCredentials(conf *irma.Configuration) ([]*irma.DisclosedAttribute, error) {
+func (entry *LogEntry) GetDisclosedCredentials(conf *irma.Configuration) ([][]*irma.DisclosedAttribute, error) {
 	if entry.Type == actionRemoval {
-		return []*irma.DisclosedAttribute{}, nil
+		return [][]*irma.DisclosedAttribute{}, nil
 	}
 
 	request, err := entry.SessionRequest()
@@ -72,13 +73,13 @@ func (entry *LogEntry) GetDisclosedCredentials(conf *irma.Configuration) ([]*irm
 		return nil, err
 	}
 	var disclosure *irma.Disclosure
-	disjunctions := request.ToDisclose()
+	disjunctions := request.Disclosure()
 	if entry.Type == irma.ActionIssuing {
 		disclosure = entry.IssueCommitment.Disclosure()
 	} else {
 		disclosure = entry.Disclosure
 	}
-	_, attrs, err := disclosure.DisclosedAttributes(conf, disjunctions)
+	_, attrs, err := disclosure.DisclosedAttributes(conf, disjunctions.Disclose)
 	return attrs, err
 }
 
@@ -105,9 +106,10 @@ func (entry *LogEntry) GetSignedMessage() (abs *irma.SignedMessage, err error) {
 	}
 	sigrequest := request.(*irma.SignatureRequest)
 	return &irma.SignedMessage{
+		LDContext: entry.SignedMessageLDContext,
 		Signature: entry.Disclosure.Proofs,
 		Nonce:     sigrequest.Nonce,
-		Context:   sigrequest.Context,
+		Context:   sigrequest.GetContext(),
 		Message:   string(entry.SignedMessage),
 		Timestamp: entry.Timestamp,
 	}, nil
@@ -132,7 +134,8 @@ func (session *session) createLogEntry(response interface{}) (*LogEntry, error) 
 		// Get the signed message and timestamp
 		request := session.request.(*irma.SignatureRequest)
 		entry.SignedMessage = []byte(request.Message)
-		entry.Timestamp = request.Timestamp
+		entry.Timestamp = session.timestamp
+		entry.SignedMessageLDContext = irma.LDContextSignedMessage
 
 		fallthrough
 	case irma.ActionDisclosing:

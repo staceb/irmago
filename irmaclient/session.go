@@ -8,6 +8,7 @@ import (
 	"runtime/debug"
 	"strings"
 
+	"github.com/bwesterb/go-atum"
 	"github.com/go-errors/errors"
 	"github.com/privacybydesign/gabi"
 	"github.com/privacybydesign/gabi/big"
@@ -31,17 +32,29 @@ type Handler interface {
 	Success(result string)
 	Cancelled()
 	Failure(err *irma.SessionError)
-	UnsatisfiableRequest(ServerName irma.TranslatedString, missing irma.AttributeDisjunctionList)
+	UnsatisfiableRequest(request irma.SessionRequest,
+		ServerName irma.TranslatedString,
+		missing MissingAttributes)
 
 	KeyshareBlocked(manager irma.SchemeManagerIdentifier, duration int)
 	KeyshareEnrollmentIncomplete(manager irma.SchemeManagerIdentifier)
 	KeyshareEnrollmentMissing(manager irma.SchemeManagerIdentifier)
 	KeyshareEnrollmentDeleted(manager irma.SchemeManagerIdentifier)
 
-	RequestIssuancePermission(request irma.IssuanceRequest, ServerName irma.TranslatedString, callback PermissionHandler)
-	RequestVerificationPermission(request irma.DisclosureRequest, ServerName irma.TranslatedString, callback PermissionHandler)
-	RequestSignaturePermission(request irma.SignatureRequest, ServerName irma.TranslatedString, callback PermissionHandler)
-	RequestSchemeManagerPermission(manager *irma.SchemeManager, callback func(proceed bool))
+	RequestIssuancePermission(request *irma.IssuanceRequest,
+		candidates [][][]*irma.AttributeIdentifier,
+		ServerName irma.TranslatedString,
+		callback PermissionHandler)
+	RequestVerificationPermission(request *irma.DisclosureRequest,
+		candidates [][][]*irma.AttributeIdentifier,
+		ServerName irma.TranslatedString,
+		callback PermissionHandler)
+	RequestSignaturePermission(request *irma.SignatureRequest,
+		candidates [][][]*irma.AttributeIdentifier,
+		ServerName irma.TranslatedString,
+		callback PermissionHandler)
+	RequestSchemeManagerPermission(manager *irma.SchemeManager,
+		callback func(proceed bool))
 
 	RequestPin(remainingAttempts int, callback PinHandler)
 }
@@ -63,9 +76,12 @@ type session struct {
 	request     irma.SessionRequest
 	done        bool
 
-	// State for issuance protocol
+	// State for issuance sessions
 	issuerProofNonce *big.Int
 	builders         gabi.ProofBuilderList
+
+	// State for signature sessions
+	timestamp *atum.Timestamp
 
 	// These are empty on manual sessions
 	Hostname  string
@@ -76,9 +92,12 @@ type session struct {
 // We implement the handler for the keyshare protocol
 var _ keyshareSessionHandler = (*session)(nil)
 
-// Supported protocol versions. Minor version numbers should be reverse sorted.
+// Supported protocol versions. Minor version numbers should be sorted.
 var supportedVersions = map[int][]int{
-	2: {4},
+	2: {
+		4, // old protocol with legacy session requests
+		5, // introduces condiscon feature
+	},
 }
 var minVersion = &irma.ProtocolVersion{Major: 2, Minor: supportedVersions[2][0]}
 var maxVersion = &irma.ProtocolVersion{Major: 2, Minor: supportedVersions[2][len(supportedVersions[2])-1]}
@@ -154,7 +173,9 @@ func (client *Client) newQrSession(qr *irma.Qr, handler Handler) SessionDismisse
 		Handler:   handler,
 		client:    client,
 	}
+
 	session.Handler.StatusUpdate(session.Action, irma.StatusCommunicating)
+	min := minVersion
 
 	// Check if the action is one of the supported types
 	switch session.Action {
@@ -162,6 +183,7 @@ func (client *Client) newQrSession(qr *irma.Qr, handler Handler) SessionDismisse
 		session.request = &irma.DisclosureRequest{}
 	case irma.ActionSigning:
 		session.request = &irma.SignatureRequest{}
+		min = &irma.ProtocolVersion{2, 5} // New ABS format is not backwards compatible with old irma server
 	case irma.ActionIssuing:
 		session.request = &irma.IssuanceRequest{}
 	case irma.ActionUnknown:
@@ -171,7 +193,7 @@ func (client *Client) newQrSession(qr *irma.Qr, handler Handler) SessionDismisse
 		return nil
 	}
 
-	session.transport.SetHeader(irma.MinVersionHeader, minVersion.String())
+	session.transport.SetHeader(irma.MinVersionHeader, min.String())
 	session.transport.SetHeader(irma.MaxVersionHeader, maxVersion.String())
 	if !strings.HasSuffix(session.ServerURL, "/") {
 		session.ServerURL += "/"
@@ -227,16 +249,18 @@ func serverName(hostname string, request irma.SessionRequest, conf *irma.Configu
 func (session *session) processSessionInfo() {
 	defer session.recoverFromPanic()
 
-	if !session.checkAndUpateConfiguration() {
+	if err := session.checkAndUpateConfiguration(); err != nil {
+		session.fail(err.(*irma.SessionError))
 		return
 	}
 
-	confirmedProtocolVersion := session.request.GetVersion()
+	baserequest := session.request.Base()
+	confirmedProtocolVersion := baserequest.ProtocolVersion
 	if confirmedProtocolVersion != nil {
 		session.Version = confirmedProtocolVersion
 	} else {
 		session.Version = irma.NewVersion(2, 0)
-		session.request.SetVersion(session.Version)
+		baserequest.ProtocolVersion = session.Version
 	}
 
 	session.ServerName = serverName(session.Hostname, session.request, session.client.Configuration)
@@ -245,7 +269,7 @@ func (session *session) processSessionInfo() {
 		ir := session.request.(*irma.IssuanceRequest)
 		_, err := ir.GetCredentialInfoList(session.client.Configuration, session.Version)
 		if err != nil {
-			session.fail(&irma.SessionError{ErrorType: irma.ErrorUnknownCredentialType, Err: err})
+			session.fail(&irma.SessionError{ErrorType: irma.ErrorUnknownIdentifier, Err: err})
 			return
 		}
 
@@ -259,30 +283,28 @@ func (session *session) processSessionInfo() {
 		}
 	}
 
-	candidates, missing := session.client.CheckSatisfiability(session.request.ToDisclose())
+	candidates, missing := session.client.CheckSatisfiability(session.request.Disclosure().Disclose)
 	if len(missing) > 0 {
-		session.Handler.UnsatisfiableRequest(session.ServerName, missing)
+		session.Handler.UnsatisfiableRequest(session.request, session.ServerName, missing)
 		return
 	}
-	session.request.SetCandidates(candidates)
 
 	// Ask for permission to execute the session
 	callback := PermissionHandler(func(proceed bool, choice *irma.DisclosureChoice) {
 		session.choice = choice
-		session.request.SetDisclosureChoice(choice)
 		go session.doSession(proceed)
 	})
 	session.Handler.StatusUpdate(session.Action, irma.StatusConnected)
 	switch session.Action {
 	case irma.ActionDisclosing:
 		session.Handler.RequestVerificationPermission(
-			*session.request.(*irma.DisclosureRequest), session.ServerName, callback)
+			session.request.(*irma.DisclosureRequest), candidates, session.ServerName, callback)
 	case irma.ActionSigning:
 		session.Handler.RequestSignaturePermission(
-			*session.request.(*irma.SignatureRequest), session.ServerName, callback)
+			session.request.(*irma.SignatureRequest), candidates, session.ServerName, callback)
 	case irma.ActionIssuing:
 		session.Handler.RequestIssuancePermission(
-			*session.request.(*irma.IssuanceRequest), session.ServerName, callback)
+			session.request.(*irma.IssuanceRequest), candidates, session.ServerName, callback)
 	default:
 		panic("Invalid session type") // does not happen, session.Action has been checked earlier
 	}
@@ -321,6 +343,7 @@ func (session *session) doSession(proceed bool) {
 			session.client.Configuration,
 			session.client.keyshareServers,
 			session.issuerProofNonce,
+			session.timestamp,
 		)
 	}
 }
@@ -336,7 +359,7 @@ func (session *session) sendResponse(message interface{}) {
 
 	switch session.Action {
 	case irma.ActionSigning:
-		irmaSignature, err := session.request.(*irma.SignatureRequest).SignatureFromMessage(message)
+		irmaSignature, err := session.request.(*irma.SignatureRequest).SignatureFromMessage(message, session.timestamp)
 		if err != nil {
 			session.fail(&irma.SessionError{ErrorType: irma.ErrorSerialization, Info: "Type assertion failed"})
 			return
@@ -446,12 +469,10 @@ func (session *session) getBuilders() (gabi.ProofBuilderList, irma.DisclosedAttr
 	var choices irma.DisclosedAttributeIndices
 
 	switch session.Action {
-	case irma.ActionSigning:
-		builders, choices, err = session.client.ProofBuilders(session.choice, session.request, true)
-	case irma.ActionDisclosing:
-		builders, choices, err = session.client.ProofBuilders(session.choice, session.request, false)
+	case irma.ActionSigning, irma.ActionDisclosing:
+		builders, choices, session.timestamp, err = session.client.ProofBuilders(session.choice, session.request)
 	case irma.ActionIssuing:
-		builders, choices, issuerProofNonce, err = session.client.IssuanceProofBuilders(session.request.(*irma.IssuanceRequest))
+		builders, choices, issuerProofNonce, err = session.client.IssuanceProofBuilders(session.request.(*irma.IssuanceRequest), session.choice)
 	}
 
 	return builders, choices, issuerProofNonce, err
@@ -464,12 +485,10 @@ func (session *session) getProof() (interface{}, error) {
 	var err error
 
 	switch session.Action {
-	case irma.ActionSigning:
-		message, err = session.client.Proofs(session.choice, session.request, true)
-	case irma.ActionDisclosing:
-		message, err = session.client.Proofs(session.choice, session.request, false)
+	case irma.ActionSigning, irma.ActionDisclosing:
+		message, session.timestamp, err = session.client.Proofs(session.choice, session.request)
 	case irma.ActionIssuing:
-		message, session.builders, err = session.client.IssueCommitments(session.request.(*irma.IssuanceRequest))
+		message, session.builders, err = session.client.IssueCommitments(session.request.(*irma.IssuanceRequest), session.choice)
 	}
 
 	return message, err
@@ -481,12 +500,7 @@ func (session *session) getProof() (interface{}, error) {
 // and aborts the session if not
 func (session *session) checkKeyshareEnrollment() bool {
 	for id := range session.request.Identifiers().SchemeManagers {
-		manager, ok := session.client.Configuration.SchemeManagers[id]
-		if !ok {
-			session.Handler.Failure(&irma.SessionError{ErrorType: irma.ErrorUnknownSchemeManager, Info: id.String()})
-			return false
-		}
-		distributed := manager.Distributed()
+		distributed := session.client.Configuration.SchemeManagers[id].Distributed()
 		_, enrolled := session.client.keyshareServers[id]
 		if distributed && !enrolled {
 			session.Handler.KeyshareEnrollmentMissing(id)
@@ -496,40 +510,31 @@ func (session *session) checkKeyshareEnrollment() bool {
 	return true
 }
 
-func (session *session) checkAndUpateConfiguration() bool {
-	for id := range session.request.Identifiers().SchemeManagers {
-		manager, contains := session.client.Configuration.SchemeManagers[id]
-		if !contains {
-			session.fail(&irma.SessionError{
-				ErrorType: irma.ErrorUnknownSchemeManager,
-				Info:      id.String(),
-			})
-			return false
+func (session *session) checkAndUpateConfiguration() error {
+	// Download missing credential types/issuers/public keys from the scheme manager
+	downloaded, err := session.client.Configuration.Download(session.request)
+	if uerr, ok := err.(*irma.UnknownIdentifierError); ok {
+		return &irma.SessionError{ErrorType: uerr.ErrorType, Err: uerr}
+	} else if err != nil {
+		return &irma.SessionError{ErrorType: irma.ErrorConfigurationDownload, Err: err}
+	}
+	if downloaded != nil && !downloaded.Empty() {
+		if err = session.client.ConfigurationUpdated(downloaded); err != nil {
+			return err
 		}
-		if !manager.Valid {
-			session.fail(&irma.SessionError{
-				ErrorType: irma.ErrorInvalidSchemeManager,
-				Info:      string(manager.Status),
-			})
-			return false
-		}
+		session.client.handler.UpdateConfiguration(downloaded)
 	}
 
 	// Check if we are enrolled into all involved keyshare servers
 	if !session.checkKeyshareEnrollment() {
-		return false
+		return &irma.SessionError{ErrorType: irma.ErrorKeyshare}
 	}
 
-	// Download missing credential types/issuers/public keys from the scheme manager
-	downloaded, err := session.client.Configuration.Download(session.request)
-	if err != nil {
-		session.fail(&irma.SessionError{ErrorType: irma.ErrorConfigurationDownload, Err: err})
-		return false
+	if err = session.request.Disclosure().Disclose.Validate(session.client.Configuration); err != nil {
+		return &irma.SessionError{ErrorType: irma.ErrorInvalidRequest}
 	}
-	if downloaded != nil && !downloaded.Empty() {
-		session.client.handler.UpdateConfiguration(downloaded)
-	}
-	return true
+
+	return nil
 }
 
 // IsInteractive returns whether this session uses an API server or not.
@@ -553,10 +558,12 @@ func (session *session) Distributed() bool {
 		return false
 	}
 
-	for _, ai := range session.choice.Attributes {
-		smi = ai.Type.CredentialTypeIdentifier().IssuerIdentifier().SchemeManagerIdentifier()
-		if session.client.Configuration.SchemeManagers[smi].Distributed() {
-			return true
+	for _, attrlist := range session.choice.Attributes {
+		for _, ai := range attrlist {
+			smi = ai.Type.CredentialTypeIdentifier().IssuerIdentifier().SchemeManagerIdentifier()
+			if session.client.Configuration.SchemeManagers[smi].Distributed() {
+				return true
+			}
 		}
 	}
 
